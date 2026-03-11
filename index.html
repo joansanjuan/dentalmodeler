@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="es">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Herramienta 3D Dental</title>
+  <title>DentalModeler — 3D STL Editor</title>
 
   <script type="importmap">
   {
@@ -17,145 +17,134 @@
   </script>
 
   <link rel="stylesheet" href="css/styles.css" />
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
 <body>
 
 <header class="header">
   <div class="container header__inner">
-    <img class="logo" src="assets/logo.svg" alt="Logo" />
+    <a class="logo-text" href="#">Dental<span>Modeler</span></a>
   </div>
 </header>
 
 <main class="main">
-
-  <!-- ===== SELECCIÓN ===== -->
-  <section class="hero container">
-    <h1>Selección de zonas</h1>
-    <p>
-      Carga un STL y pinta triángulos arrastrando el ratón sobre la malla.
-      Alterna entre modo orbitar y modo pintar con el botón de modo.
-    </p>
+  <section class="container">
 
     <div class="card">
-      <h2>Controles</h2>
+      <div class="editor-layout">
 
-      <div class="controls">
-        <div class="controls__row">
-          <label class="control">
-            <span>Archivo STL</span>
-            <input type="file" id="stlInput" accept=".stl" />
-          </label>
-
-          <label class="control">
-            <span>Radio del pincel (unidades del modelo)</span>
-            <input type="number" id="brushRadius" min="0.01" step="0.01" value="5" disabled />
-          </label>
+        <!-- Left: viewer -->
+        <div class="editor-viewer">
+          <div id="dropZone" class="drop-zone">
+            <strong>Drop an STL file here</strong>
+            or click to browse
+            <input type="file" id="stlInput" accept=".stl" style="display:none" />
+          </div>
+          <div id="viewer"></div>
+          <p id="info">Load an STL to get started.</p>
         </div>
 
-        <div class="controls__row">
-          <button id="btnMode" class="btn btn--ghost" type="button" disabled>Modo: Orbitar</button>
-          <button id="btnClear" class="btn btn--ghost" type="button" disabled>Limpiar selección</button>
-          <button id="btnClose" class="btn btn--ghost" type="button" disabled>Cerrar agujero</button>
-          <label class="control">
-            <span>Eje extrusión</span>
-            <select id="extrudeAxis" disabled>
-              <option value="z" selected>Z</option>
-              <option value="y">Y</option>
-              <option value="x">X</option>
-            </select>
-          </label>
-          <label class="control">
-            <span>Posición del plano</span>
-            <input type="number" id="extrudePos" value="0" step="0.1" disabled />
-          </label>
-          <button id="btnExtrude" class="btn btn--ghost" type="button" disabled>Extruir a plano</button>
-          <button id="btnDelete" class="btn" type="button" disabled>Eliminar selección</button>
-          <button id="btnUndo" class="btn btn--ghost" type="button" disabled>Deshacer</button>
-          <button id="btnDownload" class="btn btn--ghost" type="button" disabled>Descargar STL</button>
-        </div>
-      </div>
+        <!-- Right: controls panel -->
+        <aside class="editor-panel">
 
-      <div id="viewer"></div>
-      <p class="hint" id="info">Carga un STL para empezar.</p>
-    </div>
+          <div class="panel-section">
+            <span class="section-label">Selection &amp; Paint</span>
+            <label class="control">
+              <span>Brush radius</span>
+              <div class="slider-row">
+                <input type="range" id="brushRadiusRange" min="0.1" max="100" step="0.1" value="1" disabled />
+                <input type="number" class="slider-num" id="brushRadiusNum" value="1" step="0.1" disabled />
+              </div>
+            </label>
+            <div class="toolbar">
+              <button id="btnClear" class="btn--icon" type="button" title="Clear selection" disabled>
+                <i data-lucide="eraser"></i>
+              </button>
+              <button id="btnUndo" class="btn--icon" type="button" title="Undo" disabled>
+                <i data-lucide="undo-2"></i>
+              </button>
+              <div class="toolbar__sep"></div>
+              <button id="btnClose" class="btn--icon" type="button" title="Close holes (no selection = all open holes)" disabled>
+                <i data-lucide="plug"></i>
+              </button>
+              <button id="btnDelete" class="btn--icon btn--danger" type="button" title="Delete selection" disabled>
+                <i data-lucide="scissors"></i>
+              </button>
+              <div class="toolbar__sep"></div>
+              <button id="btnDownload" class="btn--icon" type="button" title="Download STL" disabled>
+                <i data-lucide="download"></i>
+              </button>
+            </div>
+          </div>
+
+          <div class="panel-section">
+            <span class="section-label">Extrude to plane</span>
+            <label class="control">
+              <span>Axis</span>
+              <select id="extrudeAxisSelect" disabled>
+                <option value="y" selected>Y</option>
+                <option value="z">Z</option>
+                <option value="x">X</option>
+              </select>
+            </label>
+            <label class="control">
+              <span>Position</span>
+              <div class="slider-row">
+                <input type="range" id="extrudePosRange" min="-100" max="100" step="0.1" value="0" disabled />
+                <input type="number" class="slider-num" id="extrudePosNum" value="0" step="0.1" disabled />
+              </div>
+            </label>
+            <button id="btnExtrude" class="btn btn--ghost btn--full" type="button" disabled>
+              <i data-lucide="move-vertical"></i> Extrude to plane
+            </button>
+          </div>
+
+          <div class="panel-section">
+            <span class="section-label">3D Text — Emboss</span>
+            <label class="control">
+              <span>Text</span>
+              <input type="text" id="textInput" value="MY BRAND" />
+            </label>
+            <label class="control">
+              <span>Text size</span>
+              <div class="slider-row">
+                <input type="range" id="sizeRange" min="0.5" max="30" step="0.1" value="2" disabled />
+                <input type="number" class="slider-num" id="sizeNum" value="2" step="0.1" disabled />
+              </div>
+            </label>
+            <label class="control">
+              <span>Depth</span>
+              <div class="slider-row">
+                <input type="range" id="depthRange" min="0.1" max="10" step="0.1" value="1" disabled />
+                <input type="number" class="slider-num" id="depthNum" value="1" step="0.1" disabled />
+              </div>
+            </label>
+            <label class="control">
+              <span>Margin</span>
+              <div class="slider-row">
+                <input type="range" id="marginRange" min="-5" max="10" step="0.1" value="0" disabled />
+                <input type="number" class="slider-num" id="marginNum" value="0" step="0.1" disabled />
+              </div>
+            </label>
+            <div class="toolbar">
+              <button id="btnApplyText" class="btn--icon" type="button" title="Apply emboss at hover position" disabled>
+                <i data-lucide="wand-2"></i>
+              </button>
+              <button id="btnReset" class="btn--icon" type="button" title="Reset to original" disabled>
+                <i data-lucide="rotate-ccw"></i>
+              </button>
+            </div>
+          </div>
+
+        </aside>
+
+      </div><!-- /editor-layout -->
+    </div><!-- /card -->
+
   </section>
-
-  <!-- ===== TEXTO 3D ===== -->
-  <section class="hero container">
-    <h1>Texto 3D sobre STL (emboss / deboss)</h1>
-    <p>
-      Carga un STL, escribe el texto, elige relieve (añadir) o grabado (quitar), aplica y descarga el STL resultante.
-    </p>
-
-    <div class="card">
-      <h2>Controles</h2>
-
-      <div class="controls">
-        <div class="controls__row">
-          <label class="control">
-            <span>Archivo STL</span>
-            <input type="file" id="stlInput2" accept=".stl" />
-          </label>
-
-          <label class="control">
-            <span>Texto</span>
-            <input type="text" id="textInput" value="MI MARCA" />
-          </label>
-
-          <label class="control">
-            <span>Modo</span>
-            <select id="modeSelect" disabled>
-              <option value="emboss" selected>Emboss (añadir relieve)</option>
-              <option value="deboss">Deboss (grabar / restar)</option>
-            </select>
-          </label>
-        </div>
-
-        <div class="controls__row">
-          <label class="control">
-            <span>Tamaño texto</span>
-            <input type="number" id="sizeInput" min="0.1" step="0.1" value="10" disabled />
-          </label>
-
-          <label class="control">
-            <span>Profundidad</span>
-            <input type="number" id="depthInput" min="0.1" step="0.1" value="2" disabled />
-          </label>
-
-          <label class="control">
-            <span>Colocar en cara</span>
-            <select id="faceSelect" disabled>
-              <option value="z+" selected>+Z (arriba)</option>
-              <option value="z-">-Z (abajo)</option>
-              <option value="x+">+X</option>
-              <option value="x-">-X</option>
-              <option value="y+">+Y</option>
-              <option value="y-">-Y</option>
-            </select>
-          </label>
-
-          <label class="control control--grow">
-            <span>Margen desde la cara: <strong id="marginLabel">1.0</strong></span>
-            <input type="range" id="marginRange" min="0" max="10" step="0.1" value="1" disabled />
-          </label>
-        </div>
-
-        <div class="controls__row">
-          <button id="btnPreviewText" class="btn btn--ghost" type="button" disabled>Previsualizar texto</button>
-          <button id="btnApplyText" class="btn" type="button" disabled>Aplicar (CSG)</button>
-          <button id="btnReset2" class="btn btn--ghost" type="button" disabled>Volver al original</button>
-          <button id="btnDownload2" class="btn" type="button" disabled>Descargar STL</button>
-        </div>
-      </div>
-
-      <div id="viewer2"></div>
-      <p class="hint" id="info2">Carga un STL para empezar.</p>
-    </div>
-  </section>
-
 </main>
 
+<script>lucide.createIcons();</script>
 <script type="module" src="js/select.js"></script>
-<script type="module" src="js/emboss.js"></script>
 </body>
 </html>

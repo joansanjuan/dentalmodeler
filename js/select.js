@@ -3,24 +3,45 @@ import { ShapeUtils } from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
 import { STLExporter } from "three/addons/exporters/STLExporter.js";
+import { FontLoader } from "three/addons/loaders/FontLoader.js";
+import { TextGeometry } from "three/addons/geometries/TextGeometry.js";
+import { Brush, Evaluator, ADDITION } from "three-bvh-csg";
 
-const container = document.getElementById("viewer");
-const fileInput = document.getElementById("stlInput");
-const infoEl = document.getElementById("info");
-const brushRadiusInput = document.getElementById("brushRadius");
-const btnMode = document.getElementById("btnMode");
-const btnClear = document.getElementById("btnClear");
-const btnClose = document.getElementById("btnClose");
-const btnExtrude = document.getElementById("btnExtrude");
-const extrudeAxisSelect = document.getElementById("extrudeAxis");
-const extrudePosInput = document.getElementById("extrudePos");
-const btnDelete = document.getElementById("btnDelete");
-const btnUndo = document.getElementById("btnUndo");
-const btnDownload = document.getElementById("btnDownload");
+/* ===== DOM elements ===== */
+const container        = document.getElementById("viewer");
+const stlInput         = document.getElementById("stlInput");
+const dropZone         = document.getElementById("dropZone");
+const infoEl           = document.getElementById("info");
 
-/* ===== Three base ===== */
+const brushRadiusRange = document.getElementById("brushRadiusRange");
+
+const btnClear         = document.getElementById("btnClear");
+const btnUndo          = document.getElementById("btnUndo");
+const btnClose         = document.getElementById("btnClose");
+const btnDelete        = document.getElementById("btnDelete");
+const btnDownload      = document.getElementById("btnDownload");
+
+const extrudeAxisSelect = document.getElementById("extrudeAxisSelect");
+const extrudePosRange   = document.getElementById("extrudePosRange");
+const btnExtrude        = document.getElementById("btnExtrude");
+
+const textInput        = document.getElementById("textInput");
+const sizeRange        = document.getElementById("sizeRange");
+const depthRange       = document.getElementById("depthRange");
+const marginRange      = document.getElementById("marginRange");
+
+const btnApplyText     = document.getElementById("btnApplyText");
+const btnReset         = document.getElementById("btnReset");
+
+const brushRadiusNum   = document.getElementById("brushRadiusNum");
+const extrudePosNum    = document.getElementById("extrudePosNum");
+const sizeNum          = document.getElementById("sizeNum");
+const depthNum         = document.getElementById("depthNum");
+const marginNum        = document.getElementById("marginNum");
+
+/* ===== Three.js scene setup ===== */
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0e1626);
+scene.background = new THREE.Color(0xe8ecf1);
 
 const camera = new THREE.PerspectiveCamera(
   60,
@@ -47,13 +68,11 @@ d2.position.set(-1, 0.4, -0.8);
 scene.add(d2);
 
 scene.add(new THREE.AxesHelper(60));
-const grid = new THREE.GridHelper(200, 20, 0x446688, 0x223344);
-grid.position.y = -40;
-scene.add(grid);
+// No GridHelper per requirements
 
-/* ===== Colores ===== */
-const BASE_COLOR = new THREE.Color(0x7dd3fc);   // azul base
-const SEL_COLOR  = new THREE.Color(0xff6b6b);   // rojo selección
+/* ===== Colors & materials ===== */
+const BASE_COLOR = new THREE.Color(0x7dd3fc);
+const SEL_COLOR  = new THREE.Color(0xff6b6b);
 
 const material = new THREE.MeshStandardMaterial({
   vertexColors: true,
@@ -61,21 +80,38 @@ const material = new THREE.MeshStandardMaterial({
   roughness: 0.6,
 });
 
-/* ===== Estado ===== */
-const loader = new STLLoader();
-let mesh = null;
-let bbox = null;
-let selectedSet = new Set();
-let boundaryLines = null;
+const textMaterial = new THREE.MeshStandardMaterial({
+  color: 0xffd166,
+  metalness: 0.1,
+  roughness: 0.7,
+});
 
-const boundaryMat = new THREE.LineBasicMaterial({ color: 0xfbbf24 }); // amarillo
+const boundaryMat = new THREE.LineBasicMaterial({ color: 0xfbbf24 });
 
-let isPaintMode = false;
-let isPainting  = false;
+/* ===== State ===== */
+const loader   = new STLLoader();
+const exporter = new STLExporter();
+const evaluator = new Evaluator();
+evaluator.attributes = ["position", "normal"];
 
-/* ===== Undo ===== */
+let mesh           = null;
+let bbox           = null;
+let selectedSet    = new Set();
+let boundaryLines  = null;
+let isPainting     = false;
+let preExtrusionState = null;
+
+// Emboss/deboss state
+let font             = null;
+let originalGeometry = null;
+let previewTextMesh  = null;
+
+// Text hover preview
+let currentHoverHit  = null;
+let previewParamsKey = "";
+
+/* ===== Undo stack ===== */
 const undoStack = [];
-let preExtrusionState = null; // base guardada antes de la primera extrusión; permite re-extruir sin apilar
 
 function captureState() {
   return {
@@ -107,55 +143,146 @@ function pushUndo() {
   btnUndo.disabled = false;
 }
 
-const raycaster = new THREE.Raycaster();
-const mouse = new THREE.Vector2();
+/* ===== Extrusion plane visualization ===== */
+let extrudePlane = null;
+const extrudePlaneMat = new THREE.MeshBasicMaterial({
+  color: 0x3b82f6,
+  transparent: true,
+  opacity: 0.2,
+  side: THREE.DoubleSide,
+  depthWrite: false,
+});
 
-/* ===== UI helpers ===== */
+function updateExtrusionPlane() {
+  if (extrudePlane) {
+    scene.remove(extrudePlane);
+    extrudePlane.geometry.dispose();
+    extrudePlane = null;
+  }
+  if (!mesh || !bbox) return;
+  const axis = extrudeAxisSelect.value;
+  const pos = parseFloat(extrudePosRange.value) || 0;
+  const size = new THREE.Vector3();
+  bbox.getSize(size);
+  const center = new THREE.Vector3();
+  bbox.getCenter(center);
+  const planeSize = Math.max(size.x, size.y, size.z) * 1.5;
+  const geom = new THREE.PlaneGeometry(planeSize, planeSize);
+  extrudePlane = new THREE.Mesh(geom, extrudePlaneMat);
+  if (axis === 'y') {
+    extrudePlane.rotation.x = Math.PI / 2;
+    extrudePlane.position.set(center.x, pos, center.z);
+  } else if (axis === 'z') {
+    extrudePlane.position.set(center.x, center.y, pos);
+  } else {
+    extrudePlane.rotation.y = Math.PI / 2;
+    extrudePlane.position.set(pos, center.y, center.z);
+  }
+  scene.add(extrudePlane);
+}
+
+/* ===== Range slider sync helpers ===== */
+brushRadiusRange.addEventListener("input", () => {
+  brushRadiusNum.value = parseFloat(brushRadiusRange.value).toFixed(2);
+});
+brushRadiusNum.addEventListener("input", () => {
+  brushRadiusRange.value = brushRadiusNum.value;
+});
+
+extrudePosRange.addEventListener("input", () => {
+  extrudePosNum.value = parseFloat(extrudePosRange.value).toFixed(2);
+  updateExtrusionPlane();
+});
+extrudePosNum.addEventListener("input", () => {
+  extrudePosRange.value = extrudePosNum.value;
+  updateExtrusionPlane();
+});
+
+sizeRange.addEventListener("input", () => { sizeNum.value = parseFloat(sizeRange.value).toFixed(1); });
+sizeNum.addEventListener("input",   () => { sizeRange.value = sizeNum.value; });
+
+depthRange.addEventListener("input", () => { depthNum.value = parseFloat(depthRange.value).toFixed(1); });
+depthNum.addEventListener("input",   () => { depthRange.value = depthNum.value; });
+
+marginRange.addEventListener("input", () => { marginNum.value = parseFloat(marginRange.value).toFixed(1); });
+marginNum.addEventListener("input",   () => { marginRange.value = marginNum.value; });
+
+/* ===== updateExtrudePosDefault ===== */
+function updateExtrudePosDefault() {
+  if (!bbox) return;
+  const axis = extrudeAxisSelect.value;
+  const minV = axis === 'y' ? bbox.min.y : axis === 'z' ? bbox.min.z : bbox.min.x;
+  const maxV = axis === 'y' ? bbox.max.y : axis === 'z' ? bbox.max.z : bbox.max.x;
+  const range = maxV - minV;
+  extrudePosRange.min = (minV - range * 0.1).toFixed(2);
+  extrudePosRange.max = (maxV + range * 0.1).toFixed(2);
+  extrudePosRange.step = (range / 500).toFixed(3);
+  extrudePosRange.value = minV.toFixed(2);
+  extrudePosNum.value   = parseFloat(minV).toFixed(2);
+  updateExtrusionPlane();
+}
+
+/* ===== updateBrushRange ===== */
+function updateBrushRange() {
+  if (!bbox) return;
+  const size = new THREE.Vector3();
+  bbox.getSize(size);
+  const maxDim = Math.max(size.x, size.y, size.z);
+  brushRadiusRange.min = (maxDim * 0.001).toFixed(3);
+  brushRadiusRange.max = (maxDim * 0.5).toFixed(2);
+  brushRadiusRange.step = (maxDim * 0.001).toFixed(3);
+  brushRadiusRange.value = 1;
+  brushRadiusNum.value   = "1.00";
+}
+
+/* ===== setEnabled ===== */
 function setEnabled(enabled) {
-  brushRadiusInput.disabled = !enabled;
-  btnMode.disabled = !enabled;
-  btnClear.disabled = !enabled;
-  btnClose.disabled = !enabled;
-  btnExtrude.disabled = !enabled;
-  extrudeAxisSelect.disabled = !enabled;
-  extrudePosInput.disabled = !enabled;
-  btnDelete.disabled = !enabled;
+  brushRadiusRange.disabled = !enabled;
+  brushRadiusNum.disabled   = !enabled;
+  btnClear.disabled    = !enabled;
+  btnClose.disabled    = !enabled;
+  btnDelete.disabled   = !enabled;
   btnDownload.disabled = !enabled;
+  extrudeAxisSelect.disabled = !enabled;
+  extrudePosRange.disabled   = !enabled;
+  extrudePosNum.disabled     = !enabled;
+  btnExtrude.disabled        = !enabled;
+  sizeRange.disabled         = !enabled;
+  sizeNum.disabled           = !enabled;
+  depthRange.disabled        = !enabled;
+  depthNum.disabled          = !enabled;
+  marginRange.disabled       = !enabled;
+  marginNum.disabled         = !enabled;
+  btnApplyText.disabled      = !enabled;
+  btnReset.disabled          = !enabled;
   if (!enabled) btnUndo.disabled = true;
 }
 
+/* ===== Info text ===== */
 function updateInfo() {
   if (!mesh) return;
   const total = Math.floor(mesh.geometry.attributes.position.count / 3);
-  const sel = countSelectedTriangles();
-  infoEl.textContent =
-    `Triángulos: ${total.toLocaleString()} | Seleccionados: ${sel.toLocaleString()}`;
+  const sel = selectedSet.size;
+  infoEl.textContent = `Triangles: ${total.toLocaleString()} | Selected: ${sel.toLocaleString()}`;
 }
 
-function countSelectedTriangles() {
-  return selectedSet.size;
-}
-
-/* ===== Cámara ===== */
+/* ===== Camera fit ===== */
 function fitCameraToObject(object) {
   const box = new THREE.Box3().setFromObject(object);
   const size = box.getSize(new THREE.Vector3());
   const center = box.getCenter(new THREE.Vector3());
-
   const maxDim = Math.max(size.x, size.y, size.z);
   const fov = (camera.fov * Math.PI) / 180;
   let cameraZ = Math.abs((maxDim / 2) / Math.tan(fov / 2)) * 1.6;
-
   camera.near = Math.max(cameraZ / 100, 0.01);
   camera.far = cameraZ * 200;
   camera.updateProjectionMatrix();
-
   camera.position.set(center.x + cameraZ, center.y + cameraZ * 0.35, center.z + cameraZ);
   orbitControls.target.copy(center);
   orbitControls.update();
 }
 
-/* ===== Colores de vértice ===== */
+/* ===== Vertex colors ===== */
 function initVertexColors(geometry) {
   const count = geometry.attributes.position.count;
   const colors = new Float32Array(count * 3);
@@ -167,24 +294,69 @@ function initVertexColors(geometry) {
   geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
 }
 
-/* ===== Pintura ===== */
+/* ===== Paint logic ===== */
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+
+/* ===== Brush cursor ===== */
+const brushCursorMat = new THREE.MeshBasicMaterial({
+  color: 0xef4444,
+  transparent: true,
+  opacity: 0.7,
+  side: THREE.DoubleSide,
+  depthTest: false,
+});
+let brushCursor = null;
+let brushCursorRadius = -1;
+
+function updateBrushCursor(event) {
+  if (!mesh) { if (brushCursor) brushCursor.visible = false; return null; }
+
+  getMouseNDC(event);
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObject(mesh);
+
+  if (!hits.length) { if (brushCursor) brushCursor.visible = false; return null; }
+
+  const radius = Number(brushRadiusRange.value) || 1;
+
+  if (!brushCursor || brushCursorRadius !== radius) {
+    if (brushCursor) { scene.remove(brushCursor); brushCursor.geometry.dispose(); }
+    const geo = new THREE.RingGeometry(radius * 0.9, radius, 64);
+    brushCursor = new THREE.Mesh(geo, brushCursorMat);
+    brushCursor.renderOrder = 999;
+    brushCursorRadius = radius;
+    scene.add(brushCursor);
+  }
+
+  const hit = hits[0];
+  const normal = hit.face.normal.clone().transformDirection(mesh.matrixWorld).normalize();
+  brushCursor.position.copy(hit.point).addScaledVector(normal, 0.05);
+  brushCursor.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal);
+  brushCursor.visible = true;
+  return hit;
+}
+
+renderer.domElement.addEventListener("mouseleave", () => {
+  if (brushCursor) brushCursor.visible = false;
+  currentHoverHit = null;
+  if (previewTextMesh) previewTextMesh.visible = false;
+});
+
 function paintAtPoint(worldPoint) {
   if (!mesh) return;
-
   const pos = mesh.geometry.attributes.position;
   const col = mesh.geometry.attributes.color;
-  const radius = Number(brushRadiusInput.value) || 5;
+  const radius = Number(brushRadiusRange.value) || 1;
   const radiusSq = radius * radius;
-
   const centroid = new THREE.Vector3();
-
   for (let i = 0; i < pos.count; i += 3) {
     centroid.set(
       (pos.getX(i) + pos.getX(i + 1) + pos.getX(i + 2)) / 3,
       (pos.getY(i) + pos.getY(i + 1) + pos.getY(i + 2)) / 3,
       (pos.getZ(i) + pos.getZ(i + 1) + pos.getZ(i + 2)) / 3
     );
-
     if (centroid.distanceToSquared(worldPoint) <= radiusSq) {
       selectedSet.add(i / 3);
       for (let j = 0; j < 3; j++) {
@@ -192,7 +364,6 @@ function paintAtPoint(worldPoint) {
       }
     }
   }
-
   col.needsUpdate = true;
   updateInfo();
 }
@@ -204,146 +375,56 @@ function getMouseNDC(event) {
 }
 
 function tryPaint(event) {
-  if (!mesh || !isPainting) return;
+  if (!mesh || !isPainting || !event.shiftKey) return;
   getMouseNDC(event);
   raycaster.setFromCamera(mouse, camera);
   const hits = raycaster.intersectObject(mesh);
   if (hits.length > 0) paintAtPoint(hits[0].point);
 }
 
-/* ===== Eventos de ratón ===== */
 renderer.domElement.addEventListener("mousedown", (e) => {
-  if (!isPaintMode || e.button !== 0) return;
+  if (!e.shiftKey || e.button !== 0) return;
+  orbitControls.enabled = false;
   isPainting = true;
   tryPaint(e);
 });
 
 renderer.domElement.addEventListener("mousemove", (e) => {
-  if (!isPaintMode) return;
+  const hit = updateBrushCursor(e);
+  if (!isPainting && font && mesh && bbox) {
+    if (hit) {
+      currentHoverHit = hit;
+      updateHoverPreview();
+    } else {
+      currentHoverHit = null;
+      if (previewTextMesh) previewTextMesh.visible = false;
+    }
+  }
+  if (!isPainting) return;
   tryPaint(e);
 });
 
-window.addEventListener("mouseup", () => { isPainting = false; });
-
-/* ===== Botones ===== */
-btnMode.addEventListener("click", () => {
-  isPaintMode = !isPaintMode;
-  orbitControls.enabled = !isPaintMode;
-  btnMode.textContent = isPaintMode ? "Modo: Pintar" : "Modo: Orbitar";
-  btnMode.classList.toggle("btn--ghost", !isPaintMode);
-  renderer.domElement.style.cursor = isPaintMode ? "crosshair" : "grab";
+window.addEventListener("mouseup", () => {
+  isPainting = false;
+  orbitControls.enabled = true;
 });
 
-btnClear.addEventListener("click", () => {
-  if (!mesh) return;
-  const col = mesh.geometry.attributes.color;
-  for (let i = 0; i < col.count; i++) {
-    col.setXYZ(i, BASE_COLOR.r, BASE_COLOR.g, BASE_COLOR.b);
-  }
-  selectedSet.clear();
-  col.needsUpdate = true;
-  updateInfo();
-});
-
-btnUndo.addEventListener("click", () => {
-  if (!undoStack.length) return;
-  preExtrusionState = null;
-  restoreState(undoStack.pop());
-  btnUndo.disabled = undoStack.length === 0;
-});
-
-btnDelete.addEventListener("click", () => {
-  if (!mesh) return;
-  pushUndo();
-  preExtrusionState = null;
-
-  const pos = mesh.geometry.attributes.position;
-
-  const newVerts = [];
-  for (let i = 0; i < pos.count; i += 3) {
-    const isSelected = selectedSet.has(i / 3);
-    if (!isSelected) {
-      for (let j = 0; j < 3; j++) {
-        newVerts.push(pos.getX(i + j), pos.getY(i + j), pos.getZ(i + j));
-      }
-    }
-  }
-
-  if (newVerts.length === 0) {
-    infoEl.textContent = "No quedarían triángulos tras eliminar la selección.";
-    return;
-  }
-
-  const newGeom = new THREE.BufferGeometry();
-  newGeom.setAttribute("position", new THREE.Float32BufferAttribute(newVerts, 3));
-  newGeom.computeVertexNormals();
-  newGeom.computeBoundingBox();
-  newGeom.computeBoundingSphere();
-  initVertexColors(newGeom);
-
-  selectedSet.clear();
-  mesh.geometry.dispose();
-  mesh.geometry = newGeom;
-
-  updateBoundaryLines(newGeom);
-  updateInfo();
-});
-
-btnDownload.addEventListener("click", () => {
-  if (!mesh) return;
-
-  const pos = mesh.geometry.attributes.position;
-
-  const exportVerts = [];
-  for (let i = 0; i < pos.count; i += 3) {
-    const isSelected = selectedSet.has(i / 3);
-    if (!isSelected) {
-      for (let j = 0; j < 3; j++) {
-        exportVerts.push(pos.getX(i + j), pos.getY(i + j), pos.getZ(i + j));
-      }
-    }
-  }
-
-  const exportGeom = new THREE.BufferGeometry();
-  exportGeom.setAttribute("position", new THREE.Float32BufferAttribute(exportVerts, 3));
-  exportGeom.computeVertexNormals();
-
-  const exporter = new STLExporter();
-  const result = exporter.parse(new THREE.Mesh(exportGeom, material), { binary: true });
-  exportGeom.dispose();
-
-  const blob = new Blob([result], { type: "application/octet-stream" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "resultado.stl";
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-});
-
-/* ===== Aristas abiertas ===== */
-
+/* ===== Boundary lines ===== */
 function updateBoundaryLines(geometry) {
   if (boundaryLines) {
     scene.remove(boundaryLines);
     boundaryLines.geometry.dispose();
     boundaryLines = null;
   }
-
   const pos = geometry.attributes.position;
   const triCount = Math.floor(pos.count / 3);
-
   const box = geometry.boundingBox || new THREE.Box3().setFromBufferAttribute(pos);
   const size = new THREE.Vector3();
   box.getSize(size);
   const tol = Math.max(size.x, size.y, size.z) * 1e-4;
-
   function qv(idx) {
     return `${Math.round(pos.getX(idx) / tol)},${Math.round(pos.getY(idx) / tol)},${Math.round(pos.getZ(idx) / tol)}`;
   }
-
   const edgeMap = new Map();
   for (let tri = 0; tri < triCount; tri++) {
     const base = tri * 3;
@@ -356,7 +437,6 @@ function updateBoundaryLines(geometry) {
       edgeMap.get(key).push({ vA, vB });
     }
   }
-
   const lineVerts = [];
   edgeMap.forEach((entries) => {
     if (entries.length === 1) {
@@ -367,17 +447,14 @@ function updateBoundaryLines(geometry) {
       );
     }
   });
-
   if (!lineVerts.length) return;
-
   const lineGeom = new THREE.BufferGeometry();
   lineGeom.setAttribute("position", new THREE.Float32BufferAttribute(lineVerts, 3));
   boundaryLines = new THREE.LineSegments(lineGeom, boundaryMat);
   scene.add(boundaryLines);
 }
 
-/* ===== Cerrar agujero en selección ===== */
-
+/* ===== Close hole helpers ===== */
 function buildLoops3D(segments, tol) {
   const keyToIdx = new Map();
   const points = [];
@@ -440,7 +517,6 @@ function buildLoops3D(segments, tol) {
 function triangulateLoop3D(loop) {
   if (loop.length < 3) return [];
 
-  // Normal por el método de Newell
   const normal = new THREE.Vector3();
   for (let i = 0; i < loop.length; i++) {
     const c = loop[i];
@@ -461,14 +537,13 @@ function triangulateLoop3D(loop) {
     return new THREE.Vector2(d.dot(uAxis), d.dot(vAxis));
   });
 
-  // Asegurar CCW
   let area = 0;
   for (let i = 0; i < poly2D.length; i++) {
     const p = poly2D[i], q = poly2D[(i + 1) % poly2D.length];
     area += p.x * q.y - q.x * p.y;
   }
-  const orderedLoop = area < 0 ? [...loop].reverse() : loop;
-  const orderedPoly2D = area < 0 ? [...poly2D].reverse() : poly2D;
+  const orderedLoop    = area < 0 ? [...loop].reverse()    : loop;
+  const orderedPoly2D  = area < 0 ? [...poly2D].reverse()  : poly2D;
 
   let tris;
   try { tris = ShapeUtils.triangulateShape(orderedPoly2D, []); }
@@ -482,32 +557,110 @@ function triangulateLoop3D(loop) {
   return verts;
 }
 
-btnClose.addEventListener("click", () => {
+/* ===== Button: Clear ===== */
+btnClear.addEventListener("click", () => {
   if (!mesh) return;
+  const col = mesh.geometry.attributes.color;
+  for (let i = 0; i < col.count; i++) {
+    col.setXYZ(i, BASE_COLOR.r, BASE_COLOR.g, BASE_COLOR.b);
+  }
+  selectedSet.clear();
+  col.needsUpdate = true;
+  updateInfo();
+});
 
-  if (selectedSet.size === 0) {
-    infoEl.textContent = "Selecciona primero una zona de la malla.";
+/* ===== Button: Undo ===== */
+btnUndo.addEventListener("click", () => {
+  if (!undoStack.length) return;
+  preExtrusionState = null;
+  restoreState(undoStack.pop());
+  btnUndo.disabled = undoStack.length === 0;
+});
+
+/* ===== Button: Delete selection ===== */
+btnDelete.addEventListener("click", () => {
+  if (!mesh) return;
+  pushUndo();
+  preExtrusionState = null;
+
+  const pos = mesh.geometry.attributes.position;
+  const newVerts = [];
+  for (let i = 0; i < pos.count; i += 3) {
+    if (!selectedSet.has(i / 3)) {
+      for (let j = 0; j < 3; j++) {
+        newVerts.push(pos.getX(i + j), pos.getY(i + j), pos.getZ(i + j));
+      }
+    }
+  }
+
+  if (newVerts.length === 0) {
+    infoEl.textContent = "No triangles would remain after deleting the selection.";
     return;
   }
 
+  const newGeom = new THREE.BufferGeometry();
+  newGeom.setAttribute("position", new THREE.Float32BufferAttribute(newVerts, 3));
+  newGeom.computeVertexNormals();
+  newGeom.computeBoundingBox();
+  newGeom.computeBoundingSphere();
+  initVertexColors(newGeom);
+
+  selectedSet.clear();
+  mesh.geometry.dispose();
+  mesh.geometry = newGeom;
+
+  updateBoundaryLines(newGeom);
+  updateInfo();
+});
+
+/* ===== Button: Download STL ===== */
+btnDownload.addEventListener("click", () => {
+  if (!mesh) return;
+  const pos = mesh.geometry.attributes.position;
+  const exportVerts = [];
+  for (let i = 0; i < pos.count; i += 3) {
+    if (!selectedSet.has(i / 3)) {
+      for (let j = 0; j < 3; j++) {
+        exportVerts.push(pos.getX(i + j), pos.getY(i + j), pos.getZ(i + j));
+      }
+    }
+  }
+  const exportGeom = new THREE.BufferGeometry();
+  exportGeom.setAttribute("position", new THREE.Float32BufferAttribute(exportVerts, 3));
+  exportGeom.computeVertexNormals();
+
+  const result = exporter.parse(new THREE.Mesh(exportGeom, material), { binary: true });
+  exportGeom.dispose();
+
+  const blob = new Blob([result], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "result.stl";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+});
+
+/* ===== Button: Close hole ===== */
+btnClose.addEventListener("click", () => {
+  if (!mesh) return;
+
   const pos = mesh.geometry.attributes.position;
   const triCount = Math.floor(pos.count / 3);
-
-  const size = new THREE.Vector3();
-  bbox.getSize(size);
-  const tol = Math.max(size.x, size.y, size.z) * 1e-4;
+  const sv = new THREE.Vector3(); bbox.getSize(sv);
+  const tol = Math.max(sv.x, sv.y, sv.z) * 1e-4;
 
   function qv(idx) {
-    return `${Math.round(pos.getX(idx) / tol)},${Math.round(pos.getY(idx) / tol)},${Math.round(pos.getZ(idx) / tol)}`;
+    return `${Math.round(pos.getX(idx)/tol)},${Math.round(pos.getY(idx)/tol)},${Math.round(pos.getZ(idx)/tol)}`;
   }
 
-  // Construir mapa de aristas
   const edgeMap = new Map();
   for (let tri = 0; tri < triCount; tri++) {
     const base = tri * 3;
     for (let e = 0; e < 3; e++) {
-      const vA = base + e;
-      const vB = base + (e + 1) % 3;
+      const vA = base + e, vB = base + (e + 1) % 3;
       const kA = qv(vA), kB = qv(vB);
       const key = kA < kB ? `${kA}||${kB}` : `${kB}||${kA}`;
       if (!edgeMap.has(key)) edgeMap.set(key, []);
@@ -515,100 +668,96 @@ btnClose.addEventListener("click", () => {
     }
   }
 
-  // Aristas frontera:
-  // 1) Seleccionado ↔ no seleccionado: borde interior de la selección
-  // 2) Borde abierto de la malla dentro de la selección (p. ej. base abierta de un escaneo)
   const segments = [];
-  edgeMap.forEach((entries) => {
-    if (entries.length === 2) {
-      const sel0 = selectedSet.has(entries[0].tri);
-      const sel1 = selectedSet.has(entries[1].tri);
-      if (sel0 === sel1) return;
-      // Usar vértices del lado NO seleccionado para continuidad con la malla restante
-      const side = sel0 ? entries[1] : entries[0];
-      const pA = new THREE.Vector3(pos.getX(side.vA), pos.getY(side.vA), pos.getZ(side.vA));
-      const pB = new THREE.Vector3(pos.getX(side.vB), pos.getY(side.vB), pos.getZ(side.vB));
-      segments.push([pA, pB]);
-    } else if (entries.length === 1 && selectedSet.has(entries[0].tri)) {
-      // Borde abierto de la malla perteneciente a un triángulo seleccionado
-      const { vA, vB } = entries[0];
-      const pA = new THREE.Vector3(pos.getX(vA), pos.getY(vA), pos.getZ(vA));
-      const pB = new THREE.Vector3(pos.getX(vB), pos.getY(vB), pos.getZ(vB));
-      segments.push([pA, pB]);
-    }
-  });
+  if (selectedSet.size === 0) {
+    // No selection → close ALL open holes (border edges: only 1 adjacent triangle)
+    edgeMap.forEach((entries) => {
+      if (entries.length === 1) {
+        const { vA, vB } = entries[0];
+        segments.push([
+          new THREE.Vector3(pos.getX(vA), pos.getY(vA), pos.getZ(vA)),
+          new THREE.Vector3(pos.getX(vB), pos.getY(vB), pos.getZ(vB)),
+        ]);
+      }
+    });
+  } else {
+    // With selection → fill boundary of selected region
+    edgeMap.forEach((entries) => {
+      if (entries.length === 2) {
+        const sel0 = selectedSet.has(entries[0].tri);
+        const sel1 = selectedSet.has(entries[1].tri);
+        if (sel0 === sel1) return;
+        const side = sel0 ? entries[1] : entries[0];
+        segments.push([
+          new THREE.Vector3(pos.getX(side.vA), pos.getY(side.vA), pos.getZ(side.vA)),
+          new THREE.Vector3(pos.getX(side.vB), pos.getY(side.vB), pos.getZ(side.vB)),
+        ]);
+      } else if (entries.length === 1 && selectedSet.has(entries[0].tri)) {
+        const { vA, vB } = entries[0];
+        segments.push([
+          new THREE.Vector3(pos.getX(vA), pos.getY(vA), pos.getZ(vA)),
+          new THREE.Vector3(pos.getX(vB), pos.getY(vB), pos.getZ(vB)),
+        ]);
+      }
+    });
+  }
 
   if (!segments.length) {
-    infoEl.textContent = "No se encontraron bordes en la selección.";
+    infoEl.textContent = selectedSet.size === 0
+      ? "No open holes found in this mesh."
+      : "No boundary edges found in the selection.";
     return;
   }
 
   const loops = buildLoops3D(segments, tol);
-  if (!loops.length) {
-    infoEl.textContent = "No se pudo construir el contorno para cerrar.";
-    return;
-  }
+  if (!loops.length) { infoEl.textContent = "Could not build boundary loops."; return; }
 
   const newVerts = [];
   for (const loop of loops) newVerts.push(...triangulateLoop3D(loop));
-
-  if (!newVerts.length) {
-    infoEl.textContent = "No se pudo triangular el cierre.";
-    return;
-  }
+  if (!newVerts.length) { infoEl.textContent = "Could not triangulate the closure."; return; }
 
   pushUndo();
   preExtrusionState = null;
 
-  // Añadir los nuevos triángulos (color base) a la geometría existente
   const capVertCount = newVerts.length / 3;
   const capCol = new Float32Array(capVertCount * 3);
   for (let i = 0; i < capVertCount; i++) {
-    capCol[i * 3] = BASE_COLOR.r; capCol[i * 3 + 1] = BASE_COLOR.g; capCol[i * 3 + 2] = BASE_COLOR.b;
+    capCol[i*3] = BASE_COLOR.r; capCol[i*3+1] = BASE_COLOR.g; capCol[i*3+2] = BASE_COLOR.b;
   }
 
   const allPos = new Float32Array(pos.array.length + newVerts.length);
-  allPos.set(pos.array);
-  allPos.set(newVerts, pos.array.length);
+  allPos.set(pos.array); allPos.set(newVerts, pos.array.length);
 
   const existingCol = mesh.geometry.attributes.color.array;
   const allCol = new Float32Array(existingCol.length + capCol.length);
-  allCol.set(existingCol);
-  allCol.set(capCol, existingCol.length);
+  allCol.set(existingCol); allCol.set(capCol, existingCol.length);
 
   const newGeom = new THREE.BufferGeometry();
   newGeom.setAttribute("position", new THREE.Float32BufferAttribute(allPos, 3));
-  newGeom.setAttribute("color", new THREE.Float32BufferAttribute(allCol, 3));
-  newGeom.computeVertexNormals();
-  newGeom.computeBoundingBox();
-  newGeom.computeBoundingSphere();
+  newGeom.setAttribute("color",    new THREE.Float32BufferAttribute(allCol, 3));
+  newGeom.computeVertexNormals(); newGeom.computeBoundingBox(); newGeom.computeBoundingSphere();
 
-  mesh.geometry.dispose();
-  mesh.geometry = newGeom;
+  mesh.geometry.dispose(); mesh.geometry = newGeom;
   bbox = newGeom.boundingBox.clone();
-
   updateBoundaryLines(newGeom);
+
   const capTris = newVerts.length / 9;
-  infoEl.textContent = `Tapa añadida (${capTris} triángulos). Ahora pulsa "Eliminar selección".`;
+  infoEl.textContent = selectedSet.size === 0
+    ? `Closed ${loops.length} hole(s) — ${capTris} triangles added.`
+    : `Cap added (${capTris} triangles). Now click "Delete selection".`;
   updateInfo();
 });
 
-/* ===== Extruir bordes abiertos a plano ===== */
+/* ===== Extrude axis change ===== */
+extrudeAxisSelect.addEventListener("change", () => {
+  updateExtrudePosDefault();
+  updateExtrusionPlane();
+});
 
-function updateExtrudePosDefault() {
-  if (!bbox) return;
-  const axis = extrudeAxisSelect.value;
-  const val = axis === 'z' ? bbox.min.z : axis === 'y' ? bbox.min.y : bbox.min.x;
-  extrudePosInput.value = val.toFixed(2);
-}
-
-extrudeAxisSelect.addEventListener("change", updateExtrudePosDefault);
-
+/* ===== Button: Extrude to plane ===== */
 btnExtrude.addEventListener("click", () => {
   if (!mesh) return;
 
-  // Si ya se extruía antes, volver a la base y recalcular (alargar/acortar sin apilar undo).
-  // Si es la primera vez, guardar undo + guardar base.
   if (preExtrusionState) {
     restoreState(preExtrusionState);
   } else {
@@ -616,8 +765,8 @@ btnExtrude.addEventListener("click", () => {
     preExtrusionState = captureState();
   }
 
-  const axis = extrudeAxisSelect.value;           // 'x' | 'y' | 'z'
-  const planeVal = parseFloat(extrudePosInput.value) || 0;
+  const axis = extrudeAxisSelect.value;
+  const planeVal = parseFloat(extrudePosRange.value) || 0;
 
   function project(p) {
     if (axis === 'z') return new THREE.Vector3(p.x, p.y, planeVal);
@@ -639,7 +788,6 @@ btnExtrude.addEventListener("click", () => {
     return `${Math.round(v.x / tol)},${Math.round(v.y / tol)},${Math.round(v.z / tol)}`;
   }
 
-  // Mapa de aristas para encontrar bordes abiertos
   const edgeMap = new Map();
   for (let tri = 0; tri < triCount; tri++) {
     const base = tri * 3;
@@ -654,7 +802,6 @@ btnExtrude.addEventListener("click", () => {
   }
 
   const newVerts = [];
-  // Grafo dirigido: kA → [kB, …] siguiendo la dirección vA→vB del triángulo
   const dirAdj = new Map();
   const vertPos = new Map();
 
@@ -665,12 +812,9 @@ btnExtrude.addEventListener("click", () => {
     const Q = new THREE.Vector3(pos.getX(vB), pos.getY(vB), pos.getZ(vB));
     const Pp = project(P), Qp = project(Q);
 
-    // Paredes: winding consistente con la malla CCW (normal exterior = derecha de P→Q)
-    // (P, Pp, Q) + (Q, Pp, Qp)
     newVerts.push(P.x, P.y, P.z,  Pp.x, Pp.y, Pp.z,  Q.x, Q.y, Q.z);
     newVerts.push(Q.x, Q.y, Q.z,  Pp.x, Pp.y, Pp.z,  Qp.x, Qp.y, Qp.z);
 
-    // Registrar arista dirigida para la tapa
     const kA = qvVec(P), kB = qvVec(Q);
     vertPos.set(kA, P); vertPos.set(kB, Q);
     if (!dirAdj.has(kA)) dirAdj.set(kA, []);
@@ -678,11 +822,10 @@ btnExtrude.addEventListener("click", () => {
   });
 
   if (!newVerts.length) {
-    infoEl.textContent = "La malla no tiene bordes abiertos para extruir.";
+    infoEl.textContent = "The mesh has no open edges to extrude.";
     return;
   }
 
-  // Construir loops dirigidos (preservan el winding de la malla) para la tapa
   const visitedKeys = new Set();
   const loops = [];
   for (const startKey of dirAdj.keys()) {
@@ -701,18 +844,15 @@ btnExtrude.addEventListener("click", () => {
     if (loop.length >= 3) loops.push(loop);
   }
 
-  // La normal de la tapa debe apuntar ALEJÁNDOSE del centro del mesh
   const meshCenter = new THREE.Vector3();
   bbox.getCenter(meshCenter);
   const meshAxisVal = axis === 'z' ? meshCenter.z : axis === 'y' ? meshCenter.y : meshCenter.x;
-  // Si el plano está por debajo del mesh, la tapa debe mirar hacia abajo (signo negativo del eje)
-  const expectedAxisSign = Math.sign(planeVal - meshAxisVal); // -1 si plano abajo, +1 si arriba
+  const expectedAxisSign = Math.sign(planeVal - meshAxisVal);
 
   for (const loop of loops) {
     const capVerts = triangulateLoop3D(loop.map(p => project(p)));
     if (capVerts.length < 9) continue;
 
-    // Normal del primer triángulo de la tapa
     const ta = new THREE.Vector3(capVerts[0], capVerts[1], capVerts[2]);
     const tb = new THREE.Vector3(capVerts[3], capVerts[4], capVerts[5]);
     const tc = new THREE.Vector3(capVerts[6], capVerts[7], capVerts[8]);
@@ -722,7 +862,6 @@ btnExtrude.addEventListener("click", () => {
                      : Math.sign(capNorm.x);
 
     if (expectedAxisSign !== 0 && actualSign !== 0 && actualSign !== expectedAxisSign) {
-      // Normal apunta al interior: invertir winding de todos los triángulos
       for (let i = 0; i < capVerts.length; i += 9) {
         for (let k = 0; k < 3; k++) {
           const tmp = capVerts[i + 3 + k];
@@ -736,7 +875,7 @@ btnExtrude.addEventListener("click", () => {
   }
 
   if (!newVerts.length) {
-    infoEl.textContent = "No se pudo generar la extrusión.";
+    infoEl.textContent = "Could not generate the extrusion.";
     return;
   }
 
@@ -758,7 +897,7 @@ btnExtrude.addEventListener("click", () => {
 
   const newGeom = new THREE.BufferGeometry();
   newGeom.setAttribute("position", new THREE.Float32BufferAttribute(allPos, 3));
-  newGeom.setAttribute("color", new THREE.Float32BufferAttribute(allCol, 3));
+  newGeom.setAttribute("color",    new THREE.Float32BufferAttribute(allCol, 3));
   newGeom.computeVertexNormals();
   newGeom.computeBoundingBox();
   newGeom.computeBoundingSphere();
@@ -768,12 +907,255 @@ btnExtrude.addEventListener("click", () => {
   bbox = newGeom.boundingBox.clone();
 
   updateBoundaryLines(newGeom);
+  updateExtrusionPlane();
+
   const newTris = newVerts.length / 9;
-  infoEl.textContent = `Extrusión a ${axis.toUpperCase()}=${planeVal} completada (${loops.length} bucle(s), ${newTris} triángulos nuevos).`;
+  infoEl.textContent = `Extruded to ${axis.toUpperCase()}=${planeVal.toFixed(2)} (${loops.length} loop(s), ${newTris} new triangles).`;
   updateInfo();
 });
 
-/* ===== Carga STL ===== */
+/* ===== Emboss / Deboss (from emboss.js) ===== */
+
+function ensureFontLoaded() {
+  if (font) return Promise.resolve(font);
+  const fl = new FontLoader();
+  const url = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/fonts/helvetiker_regular.typeface.json";
+  return new Promise((resolve, reject) => {
+    fl.load(url, (f) => { font = f; resolve(f); }, undefined, (err) => reject(err));
+  });
+}
+
+/* Returns axis normal aligned with the surface at currentHoverHit, or bbox face fallback */
+function getTextTransform() {
+  const axis = extrudeAxisSelect.value;
+  // Base direction along selected axis
+  const n = axis === 'x' ? new THREE.Vector3(1, 0, 0)
+          : axis === 'z' ? new THREE.Vector3(0, 0, 1)
+          :                new THREE.Vector3(0, 1, 0);
+
+  // Flip to match the surface side the user is hovering
+  if (currentHoverHit && currentHoverHit.face) {
+    const surfNorm = currentHoverHit.face.normal.clone().transformDirection(mesh.matrixWorld);
+    if (surfNorm.dot(n) < 0) n.negate();
+  }
+
+  // Orthonormal basis: text face ⊥ to n
+  const zAxis = n.clone().normalize();
+  let upRef = new THREE.Vector3(0, 1, 0);
+  if (Math.abs(zAxis.dot(upRef)) > 0.9) upRef.set(1, 0, 0);
+  const xAxis = new THREE.Vector3().crossVectors(upRef, zAxis).normalize();
+  const yAxis = new THREE.Vector3().crossVectors(zAxis, xAxis).normalize();
+  const quat = new THREE.Quaternion().setFromRotationMatrix(
+    new THREE.Matrix4().makeBasis(xAxis, yAxis, zAxis)
+  );
+
+  // Origin: hover hit point (ensures text intersects surface), else bbox face center
+  let origin;
+  if (currentHoverHit) {
+    origin = currentHoverHit.point.clone();
+  } else {
+    origin = new THREE.Vector3();
+    bbox.getCenter(origin);
+    if (axis === 'x') origin.x = bbox.max.x;
+    else if (axis === 'z') origin.z = bbox.max.z;
+    else origin.y = bbox.max.y;
+  }
+
+  const margin = Number(marginRange.value) || 0;
+  origin.addScaledVector(n, margin);
+
+  return { pos: origin, quat, n };
+}
+
+function buildTextMesh() {
+  const text  = (textInput.value || "").trim() || "TEXT";
+  const size  = Number(sizeRange.value)  || 2;
+  const depth = Number(depthRange.value) || 1;
+
+  const geom = new TextGeometry(text, {
+    font, size, height: depth, curveSegments: 8, bevelEnabled: false,
+  });
+  geom.computeBoundingBox();
+  const c = new THREE.Vector3();
+  geom.boundingBox.getCenter(c);
+  geom.translate(-c.x, -c.y, -c.z);
+
+  const tm = new THREE.Mesh(geom, textMaterial);
+  const { pos, quat } = getTextTransform();
+  tm.position.copy(pos);
+  tm.quaternion.copy(quat);
+  tm.updateMatrixWorld(true);
+  return tm;
+}
+
+function sanitizeGeometryForCSG(geometry) {
+  let g = geometry.clone();
+  if (g.index) g = g.toNonIndexed();
+  const keep = new Set(["position", "normal"]);
+  for (const key in g.attributes) {
+    if (!keep.has(key)) g.deleteAttribute(key);
+  }
+  if (!g.attributes.normal) g.computeVertexNormals();
+  g.computeBoundingBox();
+  g.computeBoundingSphere();
+  return g;
+}
+
+async function buildTextGeometryWorld() {
+  await ensureFontLoaded();
+  const m = buildTextMesh();
+  const g = m.geometry.clone();
+  g.applyMatrix4(m.matrixWorld);
+  return sanitizeGeometryForCSG(g);
+}
+
+function clearPreview() {
+  if (previewTextMesh) {
+    scene.remove(previewTextMesh);
+    previewTextMesh.geometry.dispose();
+    previewTextMesh = null;
+    previewParamsKey = "";
+  }
+}
+
+/* Synchronous hover preview — font must already be loaded */
+function updateHoverPreview() {
+  if (!font || !currentHoverHit || !bbox) {
+    if (previewTextMesh) previewTextMesh.visible = false;
+    return;
+  }
+  const key = `${textInput.value}|${sizeRange.value}|${depthRange.value}`;
+  if (key !== previewParamsKey || !previewTextMesh) {
+    // Rebuild edge geometry
+    if (previewTextMesh) {
+      scene.remove(previewTextMesh);
+      previewTextMesh.geometry.dispose();
+      previewTextMesh = null;
+    }
+    const text  = (textInput.value || "").trim() || "TEXT";
+    const size  = Number(sizeRange.value)  || 2;
+    const depth = Number(depthRange.value) || 1;
+    const geom = new TextGeometry(text, { font, size, height: depth, curveSegments: 8, bevelEnabled: false });
+    geom.computeBoundingBox();
+    const c = new THREE.Vector3();
+    geom.boundingBox.getCenter(c);
+    geom.translate(-c.x, -c.y, -c.z);
+    const edges = new THREE.EdgesGeometry(geom);
+    geom.dispose();
+    previewTextMesh = new THREE.LineSegments(edges,
+      new THREE.LineBasicMaterial({ color: 0xffd166, depthTest: false }));
+    previewTextMesh.renderOrder = 998;
+    scene.add(previewTextMesh);
+    previewParamsKey = key;
+  }
+  // Update transform every frame (fast — no geometry rebuild)
+  const { pos, quat } = getTextTransform();
+  previewTextMesh.position.copy(pos);
+  previewTextMesh.quaternion.copy(quat);
+  previewTextMesh.visible = true;
+}
+
+async function applyTextCSG() {
+  if (!mesh || !bbox) return;
+  await ensureFontLoaded();
+  clearPreview();
+
+  const baseGeom = sanitizeGeometryForCSG(mesh.geometry);
+  const textGeomWorld = await buildTextGeometryWorld();
+
+  const a = new Brush(baseGeom);
+  const b = new Brush(textGeomWorld);
+
+  const result = evaluator.evaluate(a, b, ADDITION);
+
+  const resultGeom = result.geometry.clone();
+  resultGeom.computeVertexNormals();
+  resultGeom.computeBoundingBox();
+  resultGeom.computeBoundingSphere();
+
+  // Convert to non-indexed and add vertex colors
+  let finalGeom = resultGeom;
+  if (finalGeom.index) finalGeom = finalGeom.toNonIndexed();
+  initVertexColors(finalGeom);
+  selectedSet.clear();
+
+  mesh.geometry.dispose();
+  mesh.geometry = finalGeom;
+  bbox = finalGeom.boundingBox ? finalGeom.boundingBox.clone() : new THREE.Box3().setFromBufferAttribute(finalGeom.attributes.position);
+
+  updateBoundaryLines(finalGeom);
+
+  const total = Math.floor(finalGeom.attributes.position.count / 3);
+  infoEl.textContent = `Emboss applied | Triangles: ${total.toLocaleString()}`;
+  updateInfo();
+}
+
+/* ===== Button: Apply CSG ===== */
+btnApplyText.addEventListener("click", () => {
+  applyTextCSG().catch((e) => {
+    console.error(e);
+    infoEl.textContent = "Error applying CSG (see console).";
+  });
+});
+
+/* ===== Button: Reset to original ===== */
+btnReset.addEventListener("click", () => {
+  if (!originalGeometry) return;
+  clearPreview();
+  selectedSet.clear();
+
+  const geom = originalGeometry.clone();
+  geom.computeVertexNormals();
+  geom.computeBoundingBox();
+  geom.computeBoundingSphere();
+
+  let finalGeom = geom;
+  if (finalGeom.index) finalGeom = finalGeom.toNonIndexed();
+  initVertexColors(finalGeom);
+
+  mesh.geometry.dispose();
+  mesh.geometry = finalGeom;
+  bbox = finalGeom.boundingBox.clone();
+
+  updateBoundaryLines(finalGeom);
+  updateExtrudePosDefault();
+
+  const total = Math.floor(finalGeom.attributes.position.count / 3);
+  infoEl.textContent = `Original restored. Triangles: ${total.toLocaleString()}`;
+  updateInfo();
+});
+
+/* ===== Drag & drop ===== */
+dropZone.addEventListener("click", () => stlInput.click());
+
+dropZone.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  dropZone.classList.add("drag-over");
+});
+
+dropZone.addEventListener("dragleave", () => {
+  dropZone.classList.remove("drag-over");
+});
+
+dropZone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dropZone.classList.remove("drag-over");
+  const file = e.dataTransfer.files[0];
+  if (file) loadFile(file);
+});
+
+stlInput.addEventListener("change", (e) => {
+  const f = e.target.files?.[0];
+  if (f) loadFile(f);
+});
+
+/* ===== Load file ===== */
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => loadGeometryFromBuffer(e.target.result, file.name);
+  reader.readAsArrayBuffer(file);
+}
+
 function loadGeometryFromBuffer(buffer, filename) {
   let geometry = loader.parse(buffer);
   geometry.computeVertexNormals();
@@ -783,6 +1165,12 @@ function loadGeometryFromBuffer(buffer, filename) {
   if (geometry.index) geometry = geometry.toNonIndexed();
 
   initVertexColors(geometry);
+
+  // Pre-load font so preview is ready on first hover
+  ensureFontLoaded().catch(console.error);
+
+  // Store original for reset
+  originalGeometry = geometry.clone();
 
   if (mesh) {
     scene.remove(mesh);
@@ -796,44 +1184,35 @@ function loadGeometryFromBuffer(buffer, filename) {
   undoStack.length = 0;
   preExtrusionState = null;
   bbox = geometry.boundingBox.clone();
+
+  clearPreview();
+  currentHoverHit = null;
   updateBoundaryLines(geometry);
   fitCameraToObject(mesh);
   setEnabled(true);
-
-  const size = new THREE.Vector3();
-  bbox.getSize(size);
-  brushRadiusInput.value = (Math.max(size.x, size.y, size.z) * 0.05).toFixed(2);
+  updateBrushRange();
   updateExtrudePosDefault();
 
-  infoEl.textContent = `Cargado: ${filename} | ` + (() => {
-    const total = Math.floor(geometry.attributes.position.count / 3);
-    return `Triángulos: ${total.toLocaleString()}`;
-  })();
+  const total = Math.floor(geometry.attributes.position.count / 3);
+  infoEl.textContent = `Loaded: ${filename} | Triangles: ${total.toLocaleString()}`;
   updateInfo();
 }
 
-fileInput.addEventListener("change", (event) => {
-  const file = event.target.files?.[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = (e) => loadGeometryFromBuffer(e.target.result, file.name);
-  reader.readAsArrayBuffer(file);
-});
-
-// Carga automática del archivo de muestra
+/* ===== Auto-load sample ===== */
 fetch("samples/sample_Lower_clean.stl")
   .then((res) => {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.arrayBuffer();
   })
-  .then((buffer) => loadGeometryFromBuffer(buffer, "texto.stl"))
+  .then((buffer) => loadGeometryFromBuffer(buffer, "sample_Lower_clean.stl"))
   .catch(() => {
-    infoEl.textContent = "Carga un STL para empezar.";
+    infoEl.textContent = "Load an STL to get started.";
   });
 
-/* ===== Loop + Resize ===== */
+/* ===== Init ===== */
 setEnabled(false);
 
+/* ===== Animate loop ===== */
 function animate() {
   requestAnimationFrame(animate);
   orbitControls.update();
@@ -841,6 +1220,7 @@ function animate() {
 }
 animate();
 
+/* ===== Resize ===== */
 window.addEventListener("resize", () => {
   const w = container.clientWidth;
   const h = container.clientHeight;
