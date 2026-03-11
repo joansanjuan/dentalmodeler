@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Texto 3D (Emboss / Deboss) sobre STL</title>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+      "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.9.8/build/index.module.js",
+      "three-bvh-csg": "https://cdn.jsdelivr.net/npm/three-bvh-csg@0.0.17/build/index.module.js"
+    }
+  }
+  </script>
+
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+
+<header class="header">
+  <div class="container header__inner">
+    <img class="logo" src="assets/logo.svg" alt="Logo" />
+    <nav class="nav">
+      <a href="index.html">Visor/Corte</a>
+      <a href="emboss.html">Texto 3D</a>
+      <a href="close-holes.html">Cerrar agujeros</a>
+      <a href="select.html">Selección</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main">
+  <section class="hero container">
+    <h1>Texto 3D sobre STL (emboss / deboss)</h1>
+    <p>
+      Carga un STL, escribe el texto, elige relieve (añadir) o grabado (quitar), aplica y descarga el STL resultante.
+    </p>
+
+    <div class="card">
+      <h2>Controles</h2>
+
+      <div class="controls">
+        <div class="controls__row">
+          <label class="control">
+            <span>Archivo STL</span>
+            <input type="file" id="stlInput2" accept=".stl" />
+          </label>
+
+          <label class="control">
+            <span>Texto</span>
+            <input type="text" id="textInput" value="MI MARCA" />
+          </label>
+
+          <label class="control">
+            <span>Modo</span>
+            <select id="modeSelect" disabled>
+              <option value="emboss" selected>Emboss (añadir relieve)</option>
+              <option value="deboss">Deboss (grabar / restar)</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="controls__row">
+          <label class="control">
+            <span>Tamaño texto</span>
+            <input type="number" id="sizeInput" min="0.1" step="0.1" value="10" disabled />
+          </label>
+
+          <label class="control">
+            <span>Profundidad</span>
+            <input type="number" id="depthInput" min="0.1" step="0.1" value="2" disabled />
+          </label>
+
+          <label class="control">
+            <span>Colocar en cara</span>
+            <select id="faceSelect" disabled>
+              <option value="z+" selected>+Z (arriba)</option>
+              <option value="z-">-Z (abajo)</option>
+              <option value="x+">+X</option>
+              <option value="x-">-X</option>
+              <option value="y+">+Y</option>
+              <option value="y-">-Y</option>
+            </select>
+          </label>
+
+          <label class="control control--grow">
+            <span>Margen desde la cara: <strong id="marginLabel">1.0</strong></span>
+            <input type="range" id="marginRange" min="0" max="10" step="0.1" value="1" disabled />
+          </label>
+        </div>
+
+        <div class="controls__row">
+          <button id="btnPreviewText" class="btn btn--ghost" type="button" disabled>Previsualizar texto</button>
+          <button id="btnApplyText" class="btn" type="button" disabled>Aplicar (CSG)</button>
+          <button id="btnReset2" class="btn btn--ghost" type="button" disabled>Volver al original</button>
+          <button id="btnDownload2" class="btn" type="button" disabled>Descargar STL</button>
+        </div>
+      </div>
+
+      <div id="viewer2"></div>
+      <p class="hint" id="info2">Carga un STL para empezar.</p>
+    </div>
+  </section>
+</main>
+
+<script type="module" src="js/emboss.js"></script>
+</body>
+</html>
+

@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cerrar agujeros grandes en STL</title>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+
+<header class="header">
+  <div class="container header__inner">
+    <img class="logo" src="assets/logo.svg" alt="Logo" />
+    <nav class="nav">
+      <a href="index.html">Visor/Corte</a>
+      <a href="emboss.html">Texto 3D</a>
+      <a href="close-holes.html">Cerrar agujeros</a>
+      <a href="select.html">Selección</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main">
+  <section class="hero container">
+    <h1>Cerrar agujeros grandes proyectando a un plano</h1>
+    <p>
+      Carga un STL con un agujero grande (por ejemplo, una base casi plana), elige el plano
+      de proyección y genera una tapa plana que cierre el agujero.
+    </p>
+
+    <div class="card">
+      <h2>Controles</h2>
+
+      <div class="controls">
+        <div class="controls__row">
+          <label class="control">
+            <span>Archivo STL</span>
+            <input type="file" id="stlInput3" accept=".stl" />
+          </label>
+
+          <label class="control">
+            <span>Plano de proyección</span>
+            <select id="planeAxisSelect" disabled>
+              <option value="z" selected>XY (Z = constante)</option>
+              <option value="y">XZ (Y = constante)</option>
+              <option value="x">YZ (X = constante)</option>
+            </select>
+          </label>
+
+          <label class="control control--grow">
+            <span>Posición del plano: <strong id="planePosLabel">—</strong></span>
+            <input type="range" id="planePosRange" min="0" max="1" step="0.001" value="0.5" disabled />
+          </label>
+        </div>
+
+        <div class="controls__row">
+          <label class="control">
+            <span>Umbral distancia al plano (para bordes) [unidades]</span>
+            <input type="number" id="thresholdInput" min="0" step="0.01" value="0.5" disabled />
+          </label>
+
+          <button id="btnPreviewCap" class="btn btn--ghost" type="button" disabled>Previsualizar tapa</button>
+          <button id="btnApplyCap" class="btn" type="button" disabled>Aplicar tapa</button>
+          <button id="btnReset3" class="btn btn--ghost" type="button" disabled>Volver al original</button>
+          <button id="btnDownload3" class="btn" type="button" disabled>Descargar STL</button>
+        </div>
+      </div>
+
+      <div id="viewer3"></div>
+      <p class="hint" id="info3">Carga un STL para empezar.</p>
+    </div>
+  </section>
+</main>
+
+<script type="module" src="js/close-holes.js"></script>
+</body>
+</html>
+
