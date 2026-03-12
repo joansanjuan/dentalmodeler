@@ -28,16 +28,16 @@ const btnExtrude        = document.getElementById("btnExtrude");
 const textInput        = document.getElementById("textInput");
 const sizeRange        = document.getElementById("sizeRange");
 const depthRange       = document.getElementById("depthRange");
-const marginRange      = document.getElementById("marginRange");
 
+const btnPickTextPoint = document.getElementById("btnPickTextPoint");
+const pickInfo         = document.getElementById("pickInfo");
 const btnApplyText     = document.getElementById("btnApplyText");
 const btnReset         = document.getElementById("btnReset");
 
-const brushRadiusNum   = document.getElementById("brushRadiusNum");
-const extrudePosNum    = document.getElementById("extrudePosNum");
-const sizeNum          = document.getElementById("sizeNum");
-const depthNum         = document.getElementById("depthNum");
-const marginNum        = document.getElementById("marginNum");
+const brushRadiusVal   = document.getElementById("brushRadiusVal");
+const extrudePosVal    = document.getElementById("extrudePosVal");
+const sizeVal          = document.getElementById("sizeVal");
+const depthVal         = document.getElementById("depthVal");
 
 /* ===== Three.js scene setup ===== */
 const scene = new THREE.Scene();
@@ -106,9 +106,10 @@ let font             = null;
 let originalGeometry = null;
 let previewTextMesh  = null;
 
-// Text hover preview
-let currentHoverHit  = null;
-let previewParamsKey = "";
+// Text placement
+let isPickingTextPoint = false;
+let currentHoverHit    = null;   // the picked point (set on click, not on hover)
+let previewParamsKey   = "";
 
 /* ===== Undo stack ===== */
 const undoStack = [];
@@ -183,29 +184,17 @@ function updateExtrusionPlane() {
 
 /* ===== Range slider sync helpers ===== */
 brushRadiusRange.addEventListener("input", () => {
-  brushRadiusNum.value = parseFloat(brushRadiusRange.value).toFixed(2);
-});
-brushRadiusNum.addEventListener("input", () => {
-  brushRadiusRange.value = brushRadiusNum.value;
+  brushRadiusVal.textContent = parseFloat(brushRadiusRange.value).toFixed(2);
 });
 
 extrudePosRange.addEventListener("input", () => {
-  extrudePosNum.value = parseFloat(extrudePosRange.value).toFixed(2);
-  updateExtrusionPlane();
-});
-extrudePosNum.addEventListener("input", () => {
-  extrudePosRange.value = extrudePosNum.value;
+  extrudePosVal.textContent = parseFloat(extrudePosRange.value).toFixed(2);
   updateExtrusionPlane();
 });
 
-sizeRange.addEventListener("input", () => { sizeNum.value = parseFloat(sizeRange.value).toFixed(1); });
-sizeNum.addEventListener("input",   () => { sizeRange.value = sizeNum.value; });
+sizeRange.addEventListener("input", () => { sizeVal.textContent = parseFloat(sizeRange.value).toFixed(1); });
 
-depthRange.addEventListener("input", () => { depthNum.value = parseFloat(depthRange.value).toFixed(1); });
-depthNum.addEventListener("input",   () => { depthRange.value = depthNum.value; });
-
-marginRange.addEventListener("input", () => { marginNum.value = parseFloat(marginRange.value).toFixed(1); });
-marginNum.addEventListener("input",   () => { marginRange.value = marginNum.value; });
+depthRange.addEventListener("input", () => { depthVal.textContent = parseFloat(depthRange.value).toFixed(1); });
 
 /* ===== updateExtrudePosDefault ===== */
 function updateExtrudePosDefault() {
@@ -214,11 +203,11 @@ function updateExtrudePosDefault() {
   const minV = axis === 'y' ? bbox.min.y : axis === 'z' ? bbox.min.z : bbox.min.x;
   const maxV = axis === 'y' ? bbox.max.y : axis === 'z' ? bbox.max.z : bbox.max.x;
   const range = maxV - minV;
-  extrudePosRange.min = (minV - range * 0.1).toFixed(2);
-  extrudePosRange.max = (maxV + range * 0.1).toFixed(2);
+  extrudePosRange.min = (minV - range * 2.0).toFixed(2);
+  extrudePosRange.max = (maxV + range * 2.0).toFixed(2);
   extrudePosRange.step = (range / 500).toFixed(3);
   extrudePosRange.value = minV.toFixed(2);
-  extrudePosNum.value   = parseFloat(minV).toFixed(2);
+  extrudePosVal.textContent = parseFloat(minV).toFixed(2);
   updateExtrusionPlane();
 }
 
@@ -229,30 +218,25 @@ function updateBrushRange() {
   bbox.getSize(size);
   const maxDim = Math.max(size.x, size.y, size.z);
   brushRadiusRange.min = (maxDim * 0.001).toFixed(3);
-  brushRadiusRange.max = (maxDim * 0.5).toFixed(2);
+  brushRadiusRange.max = (maxDim * 0.05).toFixed(2);
   brushRadiusRange.step = (maxDim * 0.001).toFixed(3);
   brushRadiusRange.value = 1;
-  brushRadiusNum.value   = "1.00";
+  brushRadiusVal.textContent = "1.00";
 }
 
 /* ===== setEnabled ===== */
 function setEnabled(enabled) {
   brushRadiusRange.disabled = !enabled;
-  brushRadiusNum.disabled   = !enabled;
   btnClear.disabled    = !enabled;
   btnClose.disabled    = !enabled;
   btnDelete.disabled   = !enabled;
   btnDownload.disabled = !enabled;
   extrudeAxisSelect.disabled = !enabled;
   extrudePosRange.disabled   = !enabled;
-  extrudePosNum.disabled     = !enabled;
   btnExtrude.disabled        = !enabled;
   sizeRange.disabled         = !enabled;
-  sizeNum.disabled           = !enabled;
   depthRange.disabled        = !enabled;
-  depthNum.disabled          = !enabled;
-  marginRange.disabled       = !enabled;
-  marginNum.disabled         = !enabled;
+  btnPickTextPoint.disabled  = !enabled;
   btnApplyText.disabled      = !enabled;
   btnReset.disabled          = !enabled;
   if (!enabled) btnUndo.disabled = true;
@@ -311,7 +295,7 @@ let brushCursor = null;
 let brushCursorRadius = -1;
 
 function updateBrushCursor(event) {
-  if (!mesh) { if (brushCursor) brushCursor.visible = false; return null; }
+  if (!mesh || isPickingTextPoint) { if (brushCursor) brushCursor.visible = false; return null; }
 
   getMouseNDC(event);
   raycaster.setFromCamera(mouse, camera);
@@ -340,8 +324,6 @@ function updateBrushCursor(event) {
 
 renderer.domElement.addEventListener("mouseleave", () => {
   if (brushCursor) brushCursor.visible = false;
-  currentHoverHit = null;
-  if (previewTextMesh) previewTextMesh.visible = false;
 });
 
 function paintAtPoint(worldPoint) {
@@ -383,6 +365,22 @@ function tryPaint(event) {
 }
 
 renderer.domElement.addEventListener("mousedown", (e) => {
+  if (isPickingTextPoint && e.button === 0) {
+    getMouseNDC(e);
+    raycaster.setFromCamera(mouse, camera);
+    const hits = raycaster.intersectObject(mesh);
+    if (hits.length > 0) {
+      currentHoverHit = hits[0];
+      isPickingTextPoint = false;
+      btnPickTextPoint.classList.remove("active");
+      orbitControls.enabled = true;
+      renderer.domElement.style.cursor = "";
+      pickInfo.textContent = "Point set";
+      previewParamsKey = ""; // force rebuild at new surface location
+      updateHoverPreview();
+    }
+    return;
+  }
   if (!e.shiftKey || e.button !== 0) return;
   orbitControls.enabled = false;
   isPainting = true;
@@ -390,16 +388,7 @@ renderer.domElement.addEventListener("mousedown", (e) => {
 });
 
 renderer.domElement.addEventListener("mousemove", (e) => {
-  const hit = updateBrushCursor(e);
-  if (!isPainting && font && mesh && bbox) {
-    if (hit) {
-      currentHoverHit = hit;
-      updateHoverPreview();
-    } else {
-      currentHoverHit = null;
-      if (previewTextMesh) previewTextMesh.visible = false;
-    }
-  }
+  updateBrushCursor(e);
   if (!isPainting) return;
   tryPaint(e);
 });
@@ -914,7 +903,37 @@ btnExtrude.addEventListener("click", () => {
   updateInfo();
 });
 
-/* ===== Emboss / Deboss (from emboss.js) ===== */
+/* ===== Pick text point button ===== */
+btnPickTextPoint.addEventListener("click", () => {
+  if (!mesh) return;
+  if (isPickingTextPoint) {
+    isPickingTextPoint = false;
+    btnPickTextPoint.classList.remove("active");
+    orbitControls.enabled = true;
+    renderer.domElement.style.cursor = "";
+    pickInfo.textContent = currentHoverHit ? "Point set" : "No point picked";
+  } else {
+    isPickingTextPoint = true;
+    btnPickTextPoint.classList.add("active");
+    pickInfo.textContent = "Click on the mesh…";
+    orbitControls.enabled = false;
+    renderer.domElement.style.cursor = "crosshair";
+  }
+});
+
+/* ===== Text slider → refresh preview if point already picked ===== */
+function refreshPickedPreview() {
+  if (currentHoverHit && font && bbox) {
+    previewParamsKey = ""; // force geometry rebuild
+    updateHoverPreview();
+  }
+}
+[textInput, sizeRange, depthRange].forEach(el => {
+  el.addEventListener("input", refreshPickedPreview);
+});
+extrudeAxisSelect.addEventListener("change", refreshPickedPreview);
+
+/* ===== Emboss ===== */
 
 function ensureFontLoaded() {
   if (font) return Promise.resolve(font);
@@ -925,44 +944,44 @@ function ensureFontLoaded() {
   });
 }
 
-/* Returns axis normal aligned with the surface at currentHoverHit, or bbox face fallback */
+/* Compute text placement transform.
+   - Extrusion direction (n): surface normal projected onto XZ plane → always ⊥ world Y.
+   - yAxis: world Y → letters stand upright.
+   - xAxis: cross(Y, n) → reading direction, horizontal, given by pick location.
+*/
 function getTextTransform() {
-  const axis = extrudeAxisSelect.value;
-  // Base direction along selected axis
-  const n = axis === 'x' ? new THREE.Vector3(1, 0, 0)
-          : axis === 'z' ? new THREE.Vector3(0, 0, 1)
-          :                new THREE.Vector3(0, 1, 0);
+  const UP = new THREE.Vector3(0, 1, 0);
+  let n;
 
-  // Flip to match the surface side the user is hovering
   if (currentHoverHit && currentHoverHit.face) {
-    const surfNorm = currentHoverHit.face.normal.clone().transformDirection(mesh.matrixWorld);
-    if (surfNorm.dot(n) < 0) n.negate();
+    // Project surface normal onto XZ plane so n ⊥ world Y
+    const sn = currentHoverHit.face.normal.clone().transformDirection(mesh.matrixWorld);
+    n = new THREE.Vector3(sn.x, 0, sn.z);
+    if (n.lengthSq() < 0.001) n.set(1, 0, 0); // nearly-horizontal surface fallback
+    n.normalize();
+  } else {
+    // No pick yet — default to a horizontal direction from axis selector
+    const axis = extrudeAxisSelect.value;
+    n = axis === 'x' ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 0, 1);
   }
 
-  // Orthonormal basis: text face ⊥ to n
-  const zAxis = n.clone().normalize();
-  let upRef = new THREE.Vector3(0, 1, 0);
-  if (Math.abs(zAxis.dot(upRef)) > 0.9) upRef.set(1, 0, 0);
-  const xAxis = new THREE.Vector3().crossVectors(upRef, zAxis).normalize();
-  const yAxis = new THREE.Vector3().crossVectors(zAxis, xAxis).normalize();
+  // n ⊥ Y guaranteed → cross(Y, n) is always valid and horizontal
+  const xAxis = new THREE.Vector3().crossVectors(UP, n).normalize();
+  // basis: (xAxis, Y, n) is right-handed when n ⊥ Y
   const quat = new THREE.Quaternion().setFromRotationMatrix(
-    new THREE.Matrix4().makeBasis(xAxis, yAxis, zAxis)
+    new THREE.Matrix4().makeBasis(xAxis, UP, n)
   );
 
-  // Origin: hover hit point (ensures text intersects surface), else bbox face center
   let origin;
   if (currentHoverHit) {
     origin = currentHoverHit.point.clone();
   } else {
     origin = new THREE.Vector3();
     bbox.getCenter(origin);
+    const axis = extrudeAxisSelect.value;
     if (axis === 'x') origin.x = bbox.max.x;
-    else if (axis === 'z') origin.z = bbox.max.z;
-    else origin.y = bbox.max.y;
+    else origin.z = bbox.max.z;
   }
-
-  const margin = Number(marginRange.value) || 0;
-  origin.addScaledVector(n, margin);
 
   return { pos: origin, quat, n };
 }
@@ -1001,11 +1020,62 @@ function sanitizeGeometryForCSG(geometry) {
   return g;
 }
 
+/**
+ * For each lateral position in the text (perpendicular to n), cast a ray along n
+ * to find the actual mesh surface depth. Snap the back face of each letter column
+ * to that surface so every letter protrudes by exactly `depth`, following curvature.
+ */
+function conformTextGeometryToMesh(geom, n, depth, textCenter) {
+  const pos = geom.attributes.position;
+  const cache = new Map();
+  const ray = new THREE.Raycaster();
+  ray.firstHitOnly = true;
+  const nNeg = n.clone().negate();
+
+  for (let i = 0; i < pos.count; i++) {
+    const v = new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i));
+
+    // How far is this vertex from the text center along n?
+    const dz = v.clone().sub(textCenter).dot(n);
+
+    // Lateral position: project v onto the plane ⊥ n through textCenter
+    // lateral = v − dz·n
+    const lateral = v.clone().sub(n.clone().multiplyScalar(dz));
+
+    // Cache key: quantise lateral position (0.1 mm buckets)
+    const key = `${(lateral.x * 10) | 0},${(lateral.y * 10) | 0},${(lateral.z * 10) | 0}`;
+
+    if (!cache.has(key)) {
+      // Start ray far outside the mesh along +n, shoot toward −n
+      const ro = lateral.clone().addScaledVector(n, 1e4);
+      ray.set(ro, nNeg);
+      const hits = ray.intersectObject(mesh);
+      // First hit = outermost surface facing +n direction
+      cache.set(key, hits.length > 0 ? hits[0].point.clone() : lateral.clone());
+    }
+
+    const surf = cache.get(key);
+    // Offset so back face (dz = -depth/2) sits slightly INSIDE the mesh (by 15% of depth).
+    // This guarantees a clean CSG union with no coplanar / interior triangles.
+    // front face (dz = +depth/2) protrudes by ~85% of depth above the surface.
+    const penetration = depth * 0.15;
+    const np = surf.clone().addScaledVector(n, dz + depth * 0.5 - penetration);
+    pos.setXYZ(i, np.x, np.y, np.z);
+  }
+
+  pos.needsUpdate = true;
+  geom.computeVertexNormals();
+}
+
 async function buildTextGeometryWorld() {
   await ensureFontLoaded();
   const m = buildTextMesh();
+  const textCenter = m.position.clone();
   const g = m.geometry.clone();
   g.applyMatrix4(m.matrixWorld);
+  const depth = Number(depthRange.value) || 1;
+  const { n } = getTextTransform();
+  conformTextGeometryToMesh(g, n, depth, textCenter);
   return sanitizeGeometryForCSG(g);
 }
 
@@ -1018,7 +1088,7 @@ function clearPreview() {
   }
 }
 
-/* Synchronous hover preview — font must already be loaded */
+/* Build conformed preview — geometry placed in world space, no mesh transform needed */
 function updateHoverPreview() {
   if (!font || !currentHoverHit || !bbox) {
     if (previewTextMesh) previewTextMesh.visible = false;
@@ -1026,7 +1096,6 @@ function updateHoverPreview() {
   }
   const key = `${textInput.value}|${sizeRange.value}|${depthRange.value}`;
   if (key !== previewParamsKey || !previewTextMesh) {
-    // Rebuild edge geometry
     if (previewTextMesh) {
       scene.remove(previewTextMesh);
       previewTextMesh.geometry.dispose();
@@ -1035,23 +1104,29 @@ function updateHoverPreview() {
     const text  = (textInput.value || "").trim() || "TEXT";
     const size  = Number(sizeRange.value)  || 2;
     const depth = Number(depthRange.value) || 1;
-    const geom = new TextGeometry(text, { font, size, height: depth, curveSegments: 8, bevelEnabled: false });
-    geom.computeBoundingBox();
+    const tgeom = new TextGeometry(text, { font, size, height: depth, curveSegments: 8, bevelEnabled: false });
+    tgeom.computeBoundingBox();
     const c = new THREE.Vector3();
-    geom.boundingBox.getCenter(c);
-    geom.translate(-c.x, -c.y, -c.z);
-    const edges = new THREE.EdgesGeometry(geom);
-    geom.dispose();
+    tgeom.boundingBox.getCenter(c);
+    tgeom.translate(-c.x, -c.y, -c.z);
+
+    // Apply world-space transform
+    const { pos: tpos, quat: tquat, n } = getTextTransform();
+    const mat = new THREE.Matrix4().compose(tpos, tquat, new THREE.Vector3(1, 1, 1));
+    tgeom.applyMatrix4(mat);
+
+    // Conform to mesh surface
+    conformTextGeometryToMesh(tgeom, n, depth, tpos.clone());
+
+    const edges = new THREE.EdgesGeometry(tgeom);
+    tgeom.dispose();
+    // Geometry is already in world space — use identity transform on the LineSegments
     previewTextMesh = new THREE.LineSegments(edges,
       new THREE.LineBasicMaterial({ color: 0xffd166, depthTest: false }));
     previewTextMesh.renderOrder = 998;
     scene.add(previewTextMesh);
     previewParamsKey = key;
   }
-  // Update transform every frame (fast — no geometry rebuild)
-  const { pos, quat } = getTextTransform();
-  previewTextMesh.position.copy(pos);
-  previewTextMesh.quaternion.copy(quat);
   previewTextMesh.visible = true;
 }
 
@@ -1187,6 +1262,11 @@ function loadGeometryFromBuffer(buffer, filename) {
 
   clearPreview();
   currentHoverHit = null;
+  isPickingTextPoint = false;
+  btnPickTextPoint.classList.remove("active");
+  pickInfo.textContent = "No point picked";
+  orbitControls.enabled = true;
+  renderer.domElement.style.cursor = "";
   updateBoundaryLines(geometry);
   fitCameraToObject(mesh);
   setEnabled(true);
@@ -1198,16 +1278,22 @@ function loadGeometryFromBuffer(buffer, filename) {
   updateInfo();
 }
 
-/* ===== Auto-load sample ===== */
-fetch("samples/sample_Lower_clean.stl")
-  .then((res) => {
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.arrayBuffer();
-  })
-  .then((buffer) => loadGeometryFromBuffer(buffer, "sample_Lower_clean.stl"))
-  .catch(() => {
-    infoEl.textContent = "Load an STL to get started.";
-  });
+/* ===== Auto-load sample (only on ?sample or #sample) ===== */
+const isSampleRoute = /[?&#]sample\b/.test(location.href);
+if (isSampleRoute) {
+  fetch("samples/sample_Lower_clean.stl")
+    .then((res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.arrayBuffer();
+    })
+    .then((buffer) => loadGeometryFromBuffer(buffer, "sample_Lower_clean.stl"))
+    .catch((err) => {
+      console.error("Sample load failed:", err);
+      infoEl.textContent = "Load an STL to get started.";
+    });
+} else {
+  infoEl.textContent = "Load an STL to get started.";
+}
 
 /* ===== Init ===== */
 setEnabled(false);

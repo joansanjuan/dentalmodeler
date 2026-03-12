@@ -307,20 +307,20 @@ input[type="range"]:disabled {
 }
 
 .editor-panel {
-  width: 260px;
+  width: 240px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
   gap: 0;
-  max-height: calc(480px + 60px);
-  overflow-y: auto;
+  max-height: none;
+  overflow-y: visible;
 }
 
 .panel-section {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 14px 0;
+  gap: 5px;
+  padding: 7px 0;
   border-bottom: 1px solid var(--border);
 }
 
@@ -330,6 +330,62 @@ input[type="range"]:disabled {
 
 .panel-section .control {
   min-width: 0;
+}
+
+/* ===== Compact panel overrides ===== */
+.editor-panel .section-label {
+  font-size: 10px;
+  letter-spacing: 0.03em;
+}
+
+.editor-panel .control > span {
+  font-size: 11px;
+}
+
+.editor-panel .control {
+  gap: 2px;
+}
+
+.editor-panel input[type="text"],
+.editor-panel select {
+  padding: 3px 6px;
+  font-size: 11px;
+}
+
+.editor-panel input[type="range"] {
+  height: 4px;
+}
+
+.editor-panel input[type="range"]::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+}
+
+.editor-panel input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+}
+
+.editor-panel .btn {
+  padding: 5px 10px;
+  font-size: 12px;
+  gap: 4px;
+}
+
+.editor-panel .pick-info {
+  font-size: 10px;
+}
+
+.editor-panel .slider-val {
+  font-size: 10px;
+}
+
+.editor-panel .toolbar {
+  gap: 4px;
+}
+
+.editor-panel .toolbar__sep {
+  height: 22px;
 }
 
 .btn--full {
@@ -361,19 +417,20 @@ hr {
   margin: 16px 0;
 }
 
-/* ===== Slider + number input row ===== */
+/* ===== Slider + value display row ===== */
 .slider-row {
   display: flex;
   flex-direction: column;
   gap: 3px;
 }
 .slider-row input[type="range"] { width: 100%; }
-.slider-num {
-  width: 52px;
-  padding: 2px 5px;
+.slider-val {
   font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
   text-align: right;
   align-self: flex-end;
+  user-select: none;
 }
 
 /* Active icon button (pick mode) */
