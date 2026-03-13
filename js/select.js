@@ -17,6 +17,7 @@ const brushRadiusRange = document.getElementById("brushRadiusRange");
 
 const btnClear         = document.getElementById("btnClear");
 const btnUndo          = document.getElementById("btnUndo");
+const btnRedo          = document.getElementById("btnRedo");
 const btnClose         = document.getElementById("btnClose");
 const btnDelete        = document.getElementById("btnDelete");
 const btnDownload      = document.getElementById("btnDownload");
@@ -58,6 +59,11 @@ container.appendChild(renderer.domElement);
 
 const orbitControls = new OrbitControls(camera, renderer.domElement);
 orbitControls.enableDamping = true;
+orbitControls.mouseButtons = {
+  LEFT:   -1,                   // handled manually (select / brush)
+  MIDDLE: THREE.MOUSE.PAN,      // rueda pulsada = trasladar
+  RIGHT:  THREE.MOUSE.ROTATE,   // botón derecho = orbitar
+};
 
 scene.add(new THREE.HemisphereLight(0xffffff, 0x223355, 0.9));
 const d1 = new THREE.DirectionalLight(0xffffff, 0.9);
@@ -80,6 +86,13 @@ const material = new THREE.MeshStandardMaterial({
   roughness: 0.6,
 });
 
+const backMaterial = new THREE.MeshStandardMaterial({
+  color: new THREE.Color(0x7dd3fc).multiplyScalar(0.45),
+  side: THREE.BackSide,
+  metalness: 0.1,
+  roughness: 0.8,
+});
+
 const textMaterial = new THREE.MeshStandardMaterial({
   color: 0xffd166,
   metalness: 0.1,
@@ -95,11 +108,13 @@ const evaluator = new Evaluator();
 evaluator.attributes = ["position", "normal"];
 
 let mesh           = null;
+let innerMesh      = null;
 let bbox           = null;
 let selectedSet    = new Set();
 let boundaryLines  = null;
 let isPainting     = false;
 let preExtrusionState = null;
+let loadedFilename = "result";
 
 // Emboss/deboss state
 let font             = null;
@@ -111,8 +126,9 @@ let isPickingTextPoint = false;
 let currentHoverHit    = null;   // the picked point (set on click, not on hover)
 let previewParamsKey   = "";
 
-/* ===== Undo stack ===== */
+/* ===== Undo / Redo stacks ===== */
 const undoStack = [];
+const redoStack = [];
 
 function captureState() {
   return {
@@ -141,7 +157,9 @@ function restoreState(state) {
 function pushUndo() {
   undoStack.push(captureState());
   if (undoStack.length > 20) undoStack.shift();
+  redoStack.length = 0;
   btnUndo.disabled = false;
+  btnRedo.disabled = true;
 }
 
 /* ===== Extrusion plane visualization ===== */
@@ -239,7 +257,7 @@ function setEnabled(enabled) {
   btnPickTextPoint.disabled  = !enabled;
   btnApplyText.disabled      = !enabled;
   btnReset.disabled          = !enabled;
-  if (!enabled) btnUndo.disabled = true;
+  if (!enabled) { btnUndo.disabled = true; btnRedo.disabled = true; }
 }
 
 /* ===== Info text ===== */
@@ -285,11 +303,8 @@ const mouse = new THREE.Vector2();
 
 /* ===== Brush cursor ===== */
 const brushCursorMat = new THREE.MeshBasicMaterial({
-  color: 0xef4444,
-  transparent: true,
-  opacity: 0.7,
-  side: THREE.DoubleSide,
-  depthTest: false,
+  color: 0xef4444, transparent: true, opacity: 0.7,
+  side: THREE.DoubleSide, depthTest: false,
 });
 let brushCursor = null;
 let brushCursorRadius = -1;
@@ -300,11 +315,9 @@ function updateBrushCursor(event) {
   getMouseNDC(event);
   raycaster.setFromCamera(mouse, camera);
   const hits = raycaster.intersectObject(mesh);
-
   if (!hits.length) { if (brushCursor) brushCursor.visible = false; return null; }
 
   const radius = Number(brushRadiusRange.value) || 1;
-
   if (!brushCursor || brushCursorRadius !== radius) {
     if (brushCursor) { scene.remove(brushCursor); brushCursor.geometry.dispose(); }
     const geo = new THREE.RingGeometry(radius * 0.9, radius, 64);
@@ -356,16 +369,10 @@ function getMouseNDC(event) {
   mouse.y = -((event.clientY - rect.top)  / rect.height) * 2 + 1;
 }
 
-function tryPaint(event) {
-  if (!mesh || !isPainting || !event.shiftKey) return;
-  getMouseNDC(event);
-  raycaster.setFromCamera(mouse, camera);
-  const hits = raycaster.intersectObject(mesh);
-  if (hits.length > 0) paintAtPoint(hits[0].point);
-}
 
 renderer.domElement.addEventListener("mousedown", (e) => {
-  if (isPickingTextPoint && e.button === 0) {
+  if (e.button !== 0) return;
+  if (isPickingTextPoint) {
     getMouseNDC(e);
     raycaster.setFromCamera(mouse, camera);
     const hits = raycaster.intersectObject(mesh);
@@ -376,26 +383,30 @@ renderer.domElement.addEventListener("mousedown", (e) => {
       orbitControls.enabled = true;
       renderer.domElement.style.cursor = "";
       pickInfo.textContent = "Point set";
-      previewParamsKey = ""; // force rebuild at new surface location
+      previewParamsKey = "";
       updateHoverPreview();
     }
     return;
   }
-  if (!e.shiftKey || e.button !== 0) return;
-  orbitControls.enabled = false;
+  if (!mesh) return;
   isPainting = true;
-  tryPaint(e);
+  getMouseNDC(e);
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObject(mesh);
+  if (hits.length > 0) paintAtPoint(hits[0].point);
 });
 
 renderer.domElement.addEventListener("mousemove", (e) => {
   updateBrushCursor(e);
-  if (!isPainting) return;
-  tryPaint(e);
+  if (!isPainting || !mesh) return;
+  getMouseNDC(e);
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObject(mesh);
+  if (hits.length > 0) paintAtPoint(hits[0].point);
 });
 
-window.addEventListener("mouseup", () => {
-  isPainting = false;
-  orbitControls.enabled = true;
+window.addEventListener("mouseup", (e) => {
+  if (e.button === 0) isPainting = false;
 });
 
 /* ===== Boundary lines ===== */
@@ -562,9 +573,93 @@ btnClear.addEventListener("click", () => {
 btnUndo.addEventListener("click", () => {
   if (!undoStack.length) return;
   preExtrusionState = null;
+  redoStack.push(captureState());
   restoreState(undoStack.pop());
   btnUndo.disabled = undoStack.length === 0;
+  btnRedo.disabled = false;
 });
+
+/* ===== Button: Redo ===== */
+btnRedo.addEventListener("click", () => {
+  if (!redoStack.length) return;
+  preExtrusionState = null;
+  undoStack.push(captureState());
+  btnUndo.disabled = false;
+  restoreState(redoStack.pop());
+  btnRedo.disabled = redoStack.length === 0;
+});
+
+/* ===== Boundary smoothing after delete ===== */
+function smoothBoundary(verts, iterations = 3, rings = 2) {
+  const vc = verts.length / 3;
+  const tc = vc / 3;
+
+  // Soldar vértices por posición cuantizada
+  const TOL = 1e4;
+  const keyToC = new Map();
+  const cXYZ = [];
+  const vToC = new Int32Array(vc);
+  for (let i = 0; i < vc; i++) {
+    const x = verts[i*3], y = verts[i*3+1], z = verts[i*3+2];
+    const k = `${Math.round(x*TOL)},${Math.round(y*TOL)},${Math.round(z*TOL)}`;
+    let ci = keyToC.get(k);
+    if (ci === undefined) { ci = cXYZ.length / 3; keyToC.set(k, ci); cXYZ.push(x, y, z); }
+    vToC[i] = ci;
+  }
+
+  const C = cXYZ.length / 3;
+  const adj = Array.from({length: C}, () => new Set());
+  const edgeUse = new Map();
+
+  for (let t = 0; t < tc; t++) {
+    const a = vToC[t*3], b = vToC[t*3+1], c = vToC[t*3+2];
+    adj[a].add(b); adj[a].add(c);
+    adj[b].add(a); adj[b].add(c);
+    adj[c].add(a); adj[c].add(b);
+    for (const [u, v] of [[a,b],[b,c],[c,a]]) {
+      const ek = u < v ? `${u}_${v}` : `${v}_${u}`;
+      edgeUse.set(ek, (edgeUse.get(ek) || 0) + 1);
+    }
+  }
+
+  // Marcar vértices de borde y expandir 'rings' anillos
+  const smooth = new Uint8Array(C);
+  let frontier = [];
+  for (const [ek, cnt] of edgeUse) {
+    if (cnt === 1) {
+      const sep = ek.indexOf('_');
+      const u = +ek.slice(0, sep), v = +ek.slice(sep + 1);
+      if (!smooth[u]) { smooth[u] = 1; frontier.push(u); }
+      if (!smooth[v]) { smooth[v] = 1; frontier.push(v); }
+    }
+  }
+  for (let r = 1; r < rings; r++) {
+    const next = [];
+    for (const v of frontier) for (const nb of adj[v]) if (!smooth[nb]) { smooth[nb] = 1; next.push(nb); }
+    frontier = next;
+  }
+
+  // Suavizado Laplaciano (blend 50%)
+  const cx = new Float64Array(cXYZ.filter((_, i) => i % 3 === 0));
+  const cy = new Float64Array(cXYZ.filter((_, i) => i % 3 === 1));
+  const cz = new Float64Array(cXYZ.filter((_, i) => i % 3 === 2));
+  for (let iter = 0; iter < iterations; iter++) {
+    for (let i = 0; i < C; i++) {
+      if (!smooth[i] || !adj[i].size) continue;
+      let sx = 0, sy = 0, sz = 0;
+      for (const nb of adj[i]) { sx += cx[nb]; sy += cy[nb]; sz += cz[nb]; }
+      const w = adj[i].size;
+      cx[i] = cx[i] * 0.5 + (sx / w) * 0.5;
+      cy[i] = cy[i] * 0.5 + (sy / w) * 0.5;
+      cz[i] = cz[i] * 0.5 + (sz / w) * 0.5;
+    }
+  }
+
+  for (let i = 0; i < vc; i++) {
+    const ci = vToC[i];
+    verts[i*3] = cx[ci]; verts[i*3+1] = cy[ci]; verts[i*3+2] = cz[ci];
+  }
+}
 
 /* ===== Button: Delete selection ===== */
 btnDelete.addEventListener("click", () => {
@@ -586,6 +681,8 @@ btnDelete.addEventListener("click", () => {
     infoEl.textContent = "No triangles would remain after deleting the selection.";
     return;
   }
+
+  smoothBoundary(newVerts, 8, 4);
 
   const newGeom = new THREE.BufferGeometry();
   newGeom.setAttribute("position", new THREE.Float32BufferAttribute(newVerts, 3));
@@ -625,7 +722,7 @@ btnDownload.addEventListener("click", () => {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = "result.stl";
+  a.download = `${loadedFilename}_Model.stl`;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -1232,6 +1329,7 @@ function loadFile(file) {
 }
 
 function loadGeometryFromBuffer(buffer, filename) {
+  loadedFilename = filename.replace(/\.stl$/i, "");
   let geometry = loader.parse(buffer);
   geometry.computeVertexNormals();
   geometry.computeBoundingBox();
@@ -1251,12 +1349,20 @@ function loadGeometryFromBuffer(buffer, filename) {
     scene.remove(mesh);
     mesh.geometry.dispose();
   }
+  if (innerMesh) {
+    scene.remove(innerMesh);
+  }
 
   mesh = new THREE.Mesh(geometry, material);
   scene.add(mesh);
 
+  innerMesh = new THREE.Mesh(geometry, backMaterial);
+  innerMesh.raycast = () => {};
+  scene.add(innerMesh);
+
   selectedSet.clear();
   undoStack.length = 0;
+  redoStack.length = 0;
   preExtrusionState = null;
   bbox = geometry.boundingBox.clone();
 
@@ -1305,6 +1411,28 @@ function animate() {
   renderer.render(scene, camera);
 }
 animate();
+
+/* ===== Resize ===== */
+/* ===== Keyboard shortcuts ===== */
+window.addEventListener("keydown", (e) => {
+  if (!mesh) return;
+  const tag = document.activeElement?.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+
+  if (e.key === "Delete") {
+    e.preventDefault();
+    btnDelete.click();
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    btnClear.click();
+  } else if (e.key === "z" && e.ctrlKey && !e.shiftKey) {
+    e.preventDefault();
+    btnUndo.click();
+  } else if ((e.key === "y" && e.ctrlKey) || (e.key === "z" && e.ctrlKey && e.shiftKey)) {
+    e.preventDefault();
+    btnRedo.click();
+  }
+});
 
 /* ===== Resize ===== */
 window.addEventListener("resize", () => {

@@ -60,8 +60,11 @@
               <button id="btnClear" class="btn--icon" type="button" title="Clear selection" disabled>
                 <i data-lucide="eraser"></i>
               </button>
-              <button id="btnUndo" class="btn--icon" type="button" title="Undo" disabled>
+              <button id="btnUndo" class="btn--icon" type="button" title="Undo (Ctrl+Z)" disabled>
                 <i data-lucide="undo-2"></i>
+              </button>
+              <button id="btnRedo" class="btn--icon" type="button" title="Redo (Ctrl+Y)" disabled>
+                <i data-lucide="redo-2"></i>
               </button>
               <div class="toolbar__sep"></div>
               <button id="btnClose" class="btn--icon" type="button" title="Close holes (no selection = all open holes)" disabled>
@@ -69,10 +72,6 @@
               </button>
               <button id="btnDelete" class="btn--icon btn--danger" type="button" title="Delete selection" disabled>
                 <i data-lucide="scissors"></i>
-              </button>
-              <div class="toolbar__sep"></div>
-              <button id="btnDownload" class="btn--icon" type="button" title="Download STL" disabled>
-                <i data-lucide="download"></i>
               </button>
             </div>
           </div>
@@ -135,6 +134,12 @@
                 <i data-lucide="rotate-ccw"></i>
               </button>
             </div>
+          </div>
+
+          <div class="panel-section">
+            <button id="btnDownload" class="btn btn--ghost btn--full" type="button" disabled>
+              <i data-lucide="save"></i> Download STL
+            </button>
           </div>
 
         </aside>
