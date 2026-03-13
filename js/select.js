@@ -67,6 +67,18 @@ const planeOffsetRange = document.getElementById("planeOffsetRange");
 const planeOffsetVal   = document.getElementById("planeOffsetVal");
 const planeControls    = document.getElementById("planeControls");
 
+/* ===== Mode switcher ===== */
+const modeBtns   = document.querySelectorAll(".mode-btn");
+const modePanels = document.querySelectorAll(".mode-panel");
+
+modeBtns.forEach(btn => {
+  btn.addEventListener("click", () => {
+    const mode = btn.dataset.mode;
+    modeBtns.forEach(b => b.classList.toggle("active", b === btn));
+    modePanels.forEach(p => { p.style.display = p.dataset.mode === mode ? "" : "none"; });
+  });
+});
+
 /* ===== Three.js scene setup ===== */
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0xe8ecf1);
