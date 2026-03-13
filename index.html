@@ -36,9 +36,9 @@
         <!-- Left: viewer -->
         <div class="editor-viewer">
           <div id="dropZone" class="drop-zone">
-            <strong>Drop an STL file here</strong>
+            <strong>Drop an STL or OBJ file here</strong>
             or click to browse
-            <input type="file" id="stlInput" accept=".stl" style="display:none" />
+            <input type="file" id="stlInput" accept=".stl,.obj" style="display:none" />
           </div>
           <div id="viewer"></div>
           <p id="info">Load an STL to get started.</p>
@@ -46,6 +46,21 @@
 
         <!-- Right: controls panel -->
         <aside class="editor-panel">
+
+          <div class="panel-section">
+            <button id="btnAutoBase" class="btn btn--ghost btn--full" type="button" disabled>
+              <i data-lucide="wand-2"></i> Auto base
+            </button>
+          </div>
+
+          <div class="panel-section" id="segSection" style="display:none">
+            <span class="section-label">Segmentation</span>
+            <button id="btnLoadSeg" class="btn btn--ghost btn--full" type="button">
+              <i data-lucide="tag"></i> Load JSON labels
+            </button>
+            <input type="file" id="segInput" accept=".json" style="display:none" />
+            <p id="segInfo" class="pick-info" style="margin-top:4px">No segmentation loaded</p>
+          </div>
 
           <div class="panel-section">
             <span class="section-label">Selection &amp; Paint</span>
@@ -57,9 +72,6 @@
               </div>
             </label>
             <div class="toolbar">
-              <button id="btnClear" class="btn--icon" type="button" title="Clear selection" disabled>
-                <i data-lucide="eraser"></i>
-              </button>
               <button id="btnUndo" class="btn--icon" type="button" title="Undo (Ctrl+Z)" disabled>
                 <i data-lucide="undo-2"></i>
               </button>
@@ -67,30 +79,42 @@
                 <i data-lucide="redo-2"></i>
               </button>
               <div class="toolbar__sep"></div>
-              <button id="btnClose" class="btn--icon" type="button" title="Close holes (no selection = all open holes)" disabled>
+              <button id="btnClose" class="btn--icon" type="button" title="Close holes" disabled style="display:none">
                 <i data-lucide="plug"></i>
               </button>
-              <button id="btnDelete" class="btn--icon btn--danger" type="button" title="Delete selection" disabled>
+              <button id="btnDelete" class="btn--icon btn--danger" type="button" title="Delete selection (Del)" disabled>
                 <i data-lucide="scissors"></i>
               </button>
             </div>
           </div>
 
           <div class="panel-section">
-            <span class="section-label">Extrude to plane</span>
+            <span class="section-label">Plane</span>
             <label class="control">
-              <span>Axis</span>
-              <select id="extrudeAxisSelect" disabled>
-                <option value="y" selected>Y</option>
-                <option value="z">Z</option>
-                <option value="x">X</option>
+              <span>Type</span>
+              <select id="planeTypeSelect" disabled>
+                <option value="none">— None —</option>
+                <option value="y">Y axis</option>
+                <option value="z">Z axis</option>
+                <option value="x">X axis</option>
+                <option value="occlusal" selected>Occlusal</option>
               </select>
             </label>
-            <label class="control">
+            <label class="control" id="axisPositionControl" style="display:none">
               <span>Position</span>
               <div class="slider-row">
                 <input type="range" id="extrudePosRange" min="-50" max="50" step="0.1" value="-20" disabled />
                 <span class="slider-val" id="extrudePosVal">-20.00</span>
+              </div>
+            </label>
+            <button id="btnDetectPlane" class="btn btn--ghost btn--full" type="button" disabled>
+              <i data-lucide="scan-line"></i> Auto-detect
+            </button>
+            <label class="control" id="planeControls" style="display:none">
+              <span>Offset</span>
+              <div class="slider-row">
+                <input type="range" id="planeOffsetRange" min="-50" max="50" step="0.1" value="0" />
+                <span class="slider-val" id="planeOffsetVal">0.0</span>
               </div>
             </label>
             <button id="btnExtrude" class="btn btn--ghost btn--full" type="button" disabled>
@@ -104,6 +128,9 @@
               <span>Text</span>
               <input type="text" id="textInput" value="PATIENT NAME" />
             </label>
+            <button id="btnUpdateTextPreview" class="btn btn--ghost btn--full" type="button" style="display:none">
+              <i data-lucide="refresh-cw"></i> Update preview
+            </button>
             <div class="control">
               <div class="toolbar">
                 <button id="btnPickTextPoint" class="btn--icon" type="button" title="Pick placement point on mesh" disabled>
@@ -149,6 +176,10 @@
 
   </section>
 </main>
+
+<div id="spinnerOverlay" class="spinner-overlay">
+  <div class="spinner"></div>
+</div>
 
 <script>lucide.createIcons();</script>
 <script type="module" src="js/select.js"></script>

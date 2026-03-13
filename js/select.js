@@ -5,7 +5,21 @@ import { STLLoader } from "three/addons/loaders/STLLoader.js";
 import { STLExporter } from "three/addons/exporters/STLExporter.js";
 import { FontLoader } from "three/addons/loaders/FontLoader.js";
 import { TextGeometry } from "three/addons/geometries/TextGeometry.js";
+import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
+import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 import { Brush, Evaluator, ADDITION } from "three-bvh-csg";
+
+/* ===== Spinner helpers ===== */
+const spinnerOverlay = document.getElementById("spinnerOverlay");
+function showSpinner() { spinnerOverlay.classList.add("active"); }
+function hideSpinner() { spinnerOverlay.classList.remove("active"); }
+// Yields two frames so the browser paints the spinner, then runs fn synchronously
+function withSpinner(fn) {
+  showSpinner();
+  return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => {
+    try { fn(); } finally { hideSpinner(); resolve(); }
+  })));
+}
 
 /* ===== DOM elements ===== */
 const container        = document.getElementById("viewer");
@@ -22,23 +36,36 @@ const btnClose         = document.getElementById("btnClose");
 const btnDelete        = document.getElementById("btnDelete");
 const btnDownload      = document.getElementById("btnDownload");
 
-const extrudeAxisSelect = document.getElementById("extrudeAxisSelect");
-const extrudePosRange   = document.getElementById("extrudePosRange");
-const btnExtrude        = document.getElementById("btnExtrude");
+const planeTypeSelect      = document.getElementById("planeTypeSelect");
+const axisPositionControl  = document.getElementById("axisPositionControl");
+const extrudePosRange      = document.getElementById("extrudePosRange");
+const btnExtrude           = document.getElementById("btnExtrude");
 
 const textInput        = document.getElementById("textInput");
 const sizeRange        = document.getElementById("sizeRange");
 const depthRange       = document.getElementById("depthRange");
 
-const btnPickTextPoint = document.getElementById("btnPickTextPoint");
-const pickInfo         = document.getElementById("pickInfo");
-const btnApplyText     = document.getElementById("btnApplyText");
-const btnReset         = document.getElementById("btnReset");
+const btnAutoBase           = document.getElementById("btnAutoBase");
+const btnPickTextPoint      = document.getElementById("btnPickTextPoint");
+const pickInfo              = document.getElementById("pickInfo");
+const btnApplyText          = document.getElementById("btnApplyText");
+const btnReset              = document.getElementById("btnReset");
+const btnUpdateTextPreview  = document.getElementById("btnUpdateTextPreview");
 
 const brushRadiusVal   = document.getElementById("brushRadiusVal");
 const extrudePosVal    = document.getElementById("extrudePosVal");
 const sizeVal          = document.getElementById("sizeVal");
 const depthVal         = document.getElementById("depthVal");
+
+const segSection  = document.getElementById("segSection");
+const btnLoadSeg  = document.getElementById("btnLoadSeg");
+const segInput    = document.getElementById("segInput");
+const segInfo     = document.getElementById("segInfo");
+
+const btnDetectPlane   = document.getElementById("btnDetectPlane");
+const planeOffsetRange = document.getElementById("planeOffsetRange");
+const planeOffsetVal   = document.getElementById("planeOffsetVal");
+const planeControls    = document.getElementById("planeControls");
 
 /* ===== Three.js scene setup ===== */
 const scene = new THREE.Scene();
@@ -73,8 +100,6 @@ const d2 = new THREE.DirectionalLight(0xffffff, 0.5);
 d2.position.set(-1, 0.4, -0.8);
 scene.add(d2);
 
-scene.add(new THREE.AxesHelper(60));
-// No GridHelper per requirements
 
 /* ===== Colors & materials ===== */
 const BASE_COLOR = new THREE.Color(0x7dd3fc);
@@ -120,11 +145,33 @@ let loadedFilename = "result";
 let font             = null;
 let originalGeometry = null;
 let previewTextMesh  = null;
+let pickRectMesh     = null;   // rectangle outline shown while isPickingTextPoint
+let pickRectDims     = null;   // { w, h } cached text bbox for the rectangle
 
 // Text placement
 let isPickingTextPoint = false;
 let currentHoverHit    = null;   // the picked point (set on click, not on hover)
 let previewParamsKey   = "";
+
+// Segmentation state
+let objOriginalIndices  = null;  // index buffer saved before toNonIndexed (for JSON label mapping)
+let segmentationColors  = null;  // Float32Array: per-vertex base colors when seg is loaded
+
+function restoreBaseColor(col, i) {
+  if (segmentationColors) {
+    col.setXYZ(i, segmentationColors[i*3], segmentationColors[i*3+1], segmentationColors[i*3+2]);
+  } else {
+    col.setXYZ(i, BASE_COLOR.r, BASE_COLOR.g, BASE_COLOR.b);
+  }
+}
+
+function fdiToColor(label) {
+  if (!label) return new THREE.Color(0xf9a8b8); // gingiva: pink
+  const quadrant = Math.floor(label / 10); // 1–4
+  const tooth    = (label % 10) - 1;       // 0–7
+  const hue = ((quadrant - 1) * 0.25 + tooth * 0.03125) % 1;
+  return new THREE.Color().setHSL(hue, 0.65, 0.55);
+}
 
 /* ===== Undo / Redo stacks ===== */
 const undoStack = [];
@@ -147,6 +194,7 @@ function restoreState(state) {
   newGeom.computeBoundingSphere();
   mesh.geometry.dispose();
   mesh.geometry = newGeom;
+  innerMesh.geometry = newGeom;
   bbox = newGeom.boundingBox.clone();
   selectedSet = new Set(state.selected);
   updateBoundaryLines(newGeom);
@@ -179,7 +227,8 @@ function updateExtrusionPlane() {
     extrudePlane = null;
   }
   if (!mesh || !bbox) return;
-  const axis = extrudeAxisSelect.value;
+  const axis = planeTypeSelect.value;
+  if (axis === 'none' || axis === 'occlusal') return;
   const pos = parseFloat(extrudePosRange.value) || 0;
   const size = new THREE.Vector3();
   bbox.getSize(size);
@@ -200,6 +249,273 @@ function updateExtrusionPlane() {
   scene.add(extrudePlane);
 }
 
+/* ===== Segmentation JSON ===== */
+btnLoadSeg.addEventListener("click", () => segInput.click());
+
+segInput.addEventListener("change", (e) => {
+  const f = e.target.files?.[0];
+  if (!f || !mesh) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    let json;
+    try { json = JSON.parse(ev.target.result); }
+    catch { segInfo.textContent = "Invalid JSON file."; return; }
+
+    const labels = json.labels;
+    if (!Array.isArray(labels)) { segInfo.textContent = "No 'labels' array found in JSON."; return; }
+
+    const col  = mesh.geometry.attributes.color;
+    const n    = col.count;
+    const buf  = new Float32Array(n * 3);
+
+    // Count unique teeth for info
+    const uniqueTeeth = new Set();
+
+    for (let i = 0; i < n; i++) {
+      // Map non-indexed vertex i → original vertex index
+      const origIdx = objOriginalIndices ? objOriginalIndices[i] : i;
+      const label   = (origIdx < labels.length) ? labels[origIdx] : 0;
+      if (label !== 0) uniqueTeeth.add(label);
+      const c = fdiToColor(label);
+      buf[i*3] = c.r; buf[i*3+1] = c.g; buf[i*3+2] = c.b;
+      col.setXYZ(i, c.r, c.g, c.b);
+    }
+    col.needsUpdate = true;
+    segmentationColors = buf;
+
+    // Clear any active selection so colors are visible
+    selectedSet.clear();
+    updateInfo();
+
+    const jaw = json.jaw ? ` · ${json.jaw}` : "";
+    segInfo.textContent = `${uniqueTeeth.size} teeth detected${jaw}`;
+    segInput.value = "";
+  };
+  reader.readAsText(f);
+});
+
+/* ===== Occlusal plane state ===== */
+let occlusalPlane       = null;   // THREE.Mesh helper
+let occlusalNormal      = null;   // THREE.Vector3 detected normal
+let occlusalCenter      = null;   // THREE.Vector3 detected center (offset=0)
+
+const occlusalPlaneMat = new THREE.MeshBasicMaterial({
+  color: 0x10b981, transparent: true, opacity: 0.25,
+  side: THREE.DoubleSide, depthWrite: false,
+});
+
+/* Jacobi eigendecomposition for 3×3 symmetric matrix.
+   S = [[s00,s01,s02],[s01,s11,s12],[s02,s12,s22]]
+   Returns [{val, vec}, ...] sorted ascending by eigenvalue. */
+function jacobi3(S) {
+  let a = S.map(r => [...r]);
+  let v = [[1,0,0],[0,1,0],[0,0,1]]; // columns = eigenvectors
+  for (let iter = 0; iter < 60; iter++) {
+    let max = 0, p = 0, q = 1;
+    for (let i = 0; i < 3; i++)
+      for (let j = i+1; j < 3; j++)
+        if (Math.abs(a[i][j]) > max) { max = Math.abs(a[i][j]); p = i; q = j; }
+    if (max < 1e-12) break;
+    const tau = (a[q][q] - a[p][p]) / (2 * a[p][q]);
+    const t   = tau >= 0 ? 1/(tau + Math.sqrt(1+tau*tau)) : 1/(tau - Math.sqrt(1+tau*tau));
+    const c   = 1 / Math.sqrt(1 + t*t);
+    const s   = t * c;
+    const app = a[p][p], aqq = a[q][q], apq = a[p][q];
+    a[p][p] = app - t*apq;
+    a[q][q] = aqq + t*apq;
+    a[p][q] = a[q][p] = 0;
+    for (let r = 0; r < 3; r++) {
+      if (r !== p && r !== q) {
+        const apr = a[p][r], aqr = a[q][r];
+        a[p][r] = a[r][p] = c*apr - s*aqr;
+        a[q][r] = a[r][q] = s*apr + c*aqr;
+      }
+    }
+    for (let r = 0; r < 3; r++) {
+      const vp = v[r][p], vq = v[r][q];
+      v[r][p] = c*vp - s*vq;
+      v[r][q] = s*vp + c*vq;
+    }
+  }
+  return [0,1,2]
+    .map(i => ({ val: a[i][i], vec: new THREE.Vector3(v[0][i], v[1][i], v[2][i]).normalize() }))
+    .sort((a, b) => a.val - b.val);
+}
+
+function runOcclusalDetection() {
+  const pos = mesh.geometry.attributes.position.array;
+  const n   = pos.length / 3;
+
+  // 1. Global centroid
+  let cx=0, cy=0, cz=0;
+  for (let i=0; i<pos.length; i+=3) { cx+=pos[i]; cy+=pos[i+1]; cz+=pos[i+2]; }
+  cx/=n; cy/=n; cz/=n;
+
+  // 2. Global covariance → initial normal (smallest eigenvalue)
+  let c00=0,c01=0,c02=0,c11=0,c12=0,c22=0;
+  for (let i=0; i<pos.length; i+=3) {
+    const dx=pos[i]-cx, dy=pos[i+1]-cy, dz=pos[i+2]-cz;
+    c00+=dx*dx; c01+=dx*dy; c02+=dx*dz; c11+=dy*dy; c12+=dy*dz; c22+=dz*dz;
+  }
+  const inv = 1/n;
+  const eig1 = jacobi3([[c00*inv,c01*inv,c02*inv],[c01*inv,c11*inv,c12*inv],[c02*inv,c12*inv,c22*inv]]);
+  let normal = eig1[0].vec;
+
+  // 3. Project all verts, take top 15% (cuspid tips)
+  const projs = [];
+  for (let i=0; i<pos.length; i+=3)
+    projs.push(normal.x*(pos[i]-cx) + normal.y*(pos[i+1]-cy) + normal.z*(pos[i+2]-cz));
+  const sorted = projs.slice().sort((a,b) => b-a);
+  const threshold = sorted[Math.floor(sorted.length * 0.15)];
+
+  // 4. Centroid + covariance of cuspid region
+  let tx=0,ty=0,tz=0,tn=0;
+  let d00=0,d01=0,d02=0,d11=0,d12=0,d22=0;
+  for (let i=0; i<pos.length; i+=3) {
+    if (projs[i/3] < threshold) continue;
+    tx+=pos[i]; ty+=pos[i+1]; tz+=pos[i+2]; tn++;
+  }
+  if (!tn) return { normal, center: new THREE.Vector3(cx,cy,cz) };
+  tx/=tn; ty/=tn; tz/=tn;
+  for (let i=0; i<pos.length; i+=3) {
+    if (projs[i/3] < threshold) continue;
+    const dx=pos[i]-tx, dy=pos[i+1]-ty, dz=pos[i+2]-tz;
+    d00+=dx*dx; d01+=dx*dy; d02+=dx*dz; d11+=dy*dy; d12+=dy*dz; d22+=dz*dz;
+  }
+  const inv2 = 1/tn;
+  const eig2 = jacobi3([[d00*inv2,d01*inv2,d02*inv2],[d01*inv2,d11*inv2,d12*inv2],[d02*inv2,d12*inv2,d22*inv2]]);
+  normal = eig2[0].vec;
+  if (normal.y < 0) normal.negate(); // ensure normal points generally upward
+
+  // Compute center using only PERIPHERAL vertices (outer rim of the arch).
+  // Key: palate vertices are always INTERIOR to the horseshoe arch in the plane ⊥ N.
+  // The highest peripheral vertex = cusp tip. Palate apex is interior → excluded.
+  const nVerts = pos.length / 3;
+
+  // Orthonormal basis in the plane ⊥ normal
+  const pu = new THREE.Vector3(Math.abs(normal.x) < 0.9 ? 1 : 0, Math.abs(normal.x) < 0.9 ? 0 : 1, 0);
+  pu.addScaledVector(normal, -normal.dot(pu)).normalize();
+  const pv = new THREE.Vector3().crossVectors(normal, pu);
+
+  // Project every vertex onto (N, U, V)
+  const projN = new Float32Array(nVerts);
+  const projU = new Float32Array(nVerts);
+  const projV = new Float32Array(nVerts);
+  for (let vi = 0; vi < nVerts; vi++) {
+    const x = pos[vi*3], y = pos[vi*3+1], z = pos[vi*3+2];
+    projN[vi] = normal.x*x + normal.y*y + normal.z*z;
+    projU[vi] = pu.x*x + pu.y*y + pu.z*z;
+    projV[vi] = pv.x*x + pv.y*y + pv.z*z;
+  }
+
+  // 2D centroid reference: prefer the centroid of BOUNDARY vertices (gingival margin ring)
+  // because it is always robustly inside the horseshoe regardless of whether the scan
+  // has a closed base or not. Fallback to all-vertex centroid for closed (solid) meshes.
+  const triCount2 = Math.floor(pos.length / 9);
+  const bBox = mesh.geometry.boundingBox || new THREE.Box3().setFromBufferAttribute({ array: pos, itemSize: 3, count: nVerts });
+  const bSz = new THREE.Vector3(); bBox.getSize(bSz);
+  const tolB = Math.max(bSz.x, bSz.y, bSz.z) * 1e-4 || 1e-6;
+  function qvB(idx) {
+    return `${Math.round(pos[idx*3]/tolB)},${Math.round(pos[idx*3+1]/tolB)},${Math.round(pos[idx*3+2]/tolB)}`;
+  }
+  const bEdgeMap = new Map();
+  for (let tri = 0; tri < triCount2; tri++) {
+    for (let e = 0; e < 3; e++) {
+      const vA = tri*3+e, vB = tri*3+(e+1)%3;
+      const key = (() => { const a = qvB(vA), b = qvB(vB); return a < b ? `${a}||${b}` : `${b}||${a}`; })();
+      if (!bEdgeMap.has(key)) bEdgeMap.set(key, { vA, count: 0 });
+      bEdgeMap.get(key).count++;
+    }
+  }
+  let cu = 0, cv = 0, bCount = 0;
+  bEdgeMap.forEach(({ vA, count }) => {
+    if (count !== 1) return;
+    cu += projU[vA]; cv += projV[vA]; bCount++;
+  });
+  if (bCount > 0) { cu /= bCount; cv /= bCount; }
+  else {
+    // Closed mesh (solid model): use all-vertex centroid
+    for (let vi = 0; vi < nVerts; vi++) { cu += projU[vi]; cv += projV[vi]; }
+    cu /= nVerts; cv /= nVerts;
+  }
+
+  // Radial distance from 2D centroid
+  const radial = new Float32Array(nVerts);
+  for (let vi = 0; vi < nVerts; vi++) {
+    const du = projU[vi] - cu, dv = projV[vi] - cv;
+    radial[vi] = Math.sqrt(du*du + dv*dv);
+  }
+
+  // Keep only the outer 25% (most peripheral) — palate is always interior, never here
+  const rArr = Array.from(radial).sort((a, b) => b - a);
+  const rThresh = rArr[Math.floor(nVerts * 0.25)];
+
+  // Among peripheral vertices, take the top 15% by N projection (the cusp tips)
+  const periProjs = [];
+  for (let vi = 0; vi < nVerts; vi++)
+    if (radial[vi] >= rThresh) periProjs.push(projN[vi]);
+  periProjs.sort((a, b) => b - a);
+  const pNThresh = periProjs[Math.floor(periProjs.length * 0.15)];
+
+  let ox = 0, oy = 0, oz = 0, on2 = 0;
+  for (let vi = 0; vi < nVerts; vi++) {
+    if (radial[vi] < rThresh || projN[vi] < pNThresh) continue;
+    ox += pos[vi*3]; oy += pos[vi*3+1]; oz += pos[vi*3+2]; on2++;
+  }
+  const center = on2 > 0
+    ? new THREE.Vector3(ox / on2, oy / on2, oz / on2)
+    : new THREE.Vector3(tx, ty, tz);
+
+  return { normal, center };
+}
+
+function showOcclusalPlane(center, normal) {
+  if (occlusalPlane) { scene.remove(occlusalPlane); occlusalPlane.geometry.dispose(); }
+  const size = new THREE.Vector3();
+  bbox.getSize(size);
+  const planeSize = Math.max(size.x, size.y, size.z) * 1.6;
+  const geo = new THREE.PlaneGeometry(planeSize, planeSize);
+  occlusalPlane = new THREE.Mesh(geo, occlusalPlaneMat);
+  occlusalPlane.position.copy(center);
+  occlusalPlane.quaternion.setFromUnitVectors(new THREE.Vector3(0,0,1), normal);
+  occlusalPlane.renderOrder = 1;
+  scene.add(occlusalPlane);
+}
+
+function updateOcclusalOffset() {
+  if (!occlusalPlane || !occlusalNormal || !occlusalCenter) return;
+  const offset = parseFloat(planeOffsetRange.value);
+  occlusalPlane.position.copy(occlusalCenter).addScaledVector(occlusalNormal, offset);
+}
+
+btnDetectPlane.addEventListener("click", () => {
+  if (!mesh) return;
+  withSpinner(() => {
+  const result = runOcclusalDetection();
+  occlusalNormal = result.normal;
+  occlusalCenter = result.center.clone();
+
+  // set offset slider range based on model size
+  const size = new THREE.Vector3();
+  bbox.getSize(size);
+  const halfRange = Math.max(size.x, size.y, size.z) * 0.6;
+  planeOffsetRange.min  = (-halfRange).toFixed(2);
+  planeOffsetRange.max  = ( halfRange).toFixed(2);
+  planeOffsetRange.step = (halfRange / 200).toFixed(3);
+  planeOffsetRange.value = 0;
+  planeOffsetVal.textContent = "0.0";
+
+  showOcclusalPlane(occlusalCenter, occlusalNormal);
+  planeControls.style.display = "";
+  }); // withSpinner
+});
+
+planeOffsetRange.addEventListener("input", () => {
+  planeOffsetVal.textContent = parseFloat(planeOffsetRange.value).toFixed(1);
+  updateOcclusalOffset();
+});
+
+
 /* ===== Range slider sync helpers ===== */
 brushRadiusRange.addEventListener("input", () => {
   brushRadiusVal.textContent = parseFloat(brushRadiusRange.value).toFixed(2);
@@ -217,7 +533,8 @@ depthRange.addEventListener("input", () => { depthVal.textContent = parseFloat(d
 /* ===== updateExtrudePosDefault ===== */
 function updateExtrudePosDefault() {
   if (!bbox) return;
-  const axis = extrudeAxisSelect.value;
+  const axis = planeTypeSelect.value;
+  if (axis === 'none' || axis === 'occlusal') return;
   const minV = axis === 'y' ? bbox.min.y : axis === 'z' ? bbox.min.z : bbox.min.x;
   const maxV = axis === 'y' ? bbox.max.y : axis === 'z' ? bbox.max.z : bbox.max.x;
   const range = maxV - minV;
@@ -245,11 +562,9 @@ function updateBrushRange() {
 /* ===== setEnabled ===== */
 function setEnabled(enabled) {
   brushRadiusRange.disabled = !enabled;
-  btnClear.disabled    = !enabled;
-  btnClose.disabled    = !enabled;
   btnDelete.disabled   = !enabled;
-  btnDownload.disabled = !enabled;
-  extrudeAxisSelect.disabled = !enabled;
+  btnDownload.disabled       = !enabled;
+  planeTypeSelect.disabled   = !enabled;
   extrudePosRange.disabled   = !enabled;
   btnExtrude.disabled        = !enabled;
   sizeRange.disabled         = !enabled;
@@ -257,6 +572,8 @@ function setEnabled(enabled) {
   btnPickTextPoint.disabled  = !enabled;
   btnApplyText.disabled      = !enabled;
   btnReset.disabled          = !enabled;
+  btnDetectPlane.disabled = !enabled;
+  btnAutoBase.disabled    = !enabled;
   if (!enabled) { btnUndo.disabled = true; btnRedo.disabled = true; }
 }
 
@@ -382,22 +699,43 @@ renderer.domElement.addEventListener("mousedown", (e) => {
       btnPickTextPoint.classList.remove("active");
       orbitControls.enabled = true;
       renderer.domElement.style.cursor = "";
+      clearPickRect();
+      btnUpdateTextPreview.style.display = "none";
       pickInfo.textContent = "Point set";
       previewParamsKey = "";
-      updateHoverPreview();
+      withSpinner(() => {
+        if (!occlusalNormal && mesh) {
+          const result = runOcclusalDetection();
+          occlusalNormal = result.normal;
+          occlusalCenter = result.center.clone();
+        }
+        updateHoverPreview();
+      });
     }
     return;
   }
   if (!mesh) return;
-  isPainting = true;
   getMouseNDC(e);
   raycaster.setFromCamera(mouse, camera);
   const hits = raycaster.intersectObject(mesh);
-  if (hits.length > 0) paintAtPoint(hits[0].point);
+  if (hits.length > 0) {
+    isPainting = true;
+    pushUndo();
+    paintAtPoint(hits[0].point);
+  } else {
+    clearSelection();
+  }
 });
 
 renderer.domElement.addEventListener("mousemove", (e) => {
   updateBrushCursor(e);
+  if (isPickingTextPoint && mesh) {
+    getMouseNDC(e);
+    raycaster.setFromCamera(mouse, camera);
+    const hits = raycaster.intersectObject(mesh);
+    updatePickRect(hits.length > 0 ? hits[0] : null);
+    return;
+  }
   if (!isPainting || !mesh) return;
   getMouseNDC(e);
   raycaster.setFromCamera(mouse, camera);
@@ -410,6 +748,14 @@ window.addEventListener("mouseup", (e) => {
 });
 
 /* ===== Boundary lines ===== */
+function clearBoundaryLines() {
+  if (boundaryLines) {
+    scene.remove(boundaryLines);
+    boundaryLines.geometry.dispose();
+    boundaryLines = null;
+  }
+}
+
 function updateBoundaryLines(geometry) {
   if (boundaryLines) {
     scene.remove(boundaryLines);
@@ -557,17 +903,16 @@ function triangulateLoop3D(loop) {
   return verts;
 }
 
-/* ===== Button: Clear ===== */
-btnClear.addEventListener("click", () => {
-  if (!mesh) return;
+/* ===== Clear selection ===== */
+function clearSelection() {
+  if (!mesh || !selectedSet.size) return;
+  pushUndo();
   const col = mesh.geometry.attributes.color;
-  for (let i = 0; i < col.count; i++) {
-    col.setXYZ(i, BASE_COLOR.r, BASE_COLOR.g, BASE_COLOR.b);
-  }
+  for (let i = 0; i < col.count; i++) restoreBaseColor(col, i);
   selectedSet.clear();
   col.needsUpdate = true;
   updateInfo();
-});
+}
 
 /* ===== Button: Undo ===== */
 btnUndo.addEventListener("click", () => {
@@ -664,6 +1009,7 @@ function smoothBoundary(verts, iterations = 3, rings = 2) {
 /* ===== Button: Delete selection ===== */
 btnDelete.addEventListener("click", () => {
   if (!mesh) return;
+  withSpinner(() => {
   pushUndo();
   preExtrusionState = null;
 
@@ -694,9 +1040,11 @@ btnDelete.addEventListener("click", () => {
   selectedSet.clear();
   mesh.geometry.dispose();
   mesh.geometry = newGeom;
+  innerMesh.geometry = newGeom;
 
   updateBoundaryLines(newGeom);
   updateInfo();
+  }); // withSpinner
 });
 
 /* ===== Button: Download STL ===== */
@@ -824,6 +1172,7 @@ btnClose.addEventListener("click", () => {
   newGeom.computeVertexNormals(); newGeom.computeBoundingBox(); newGeom.computeBoundingSphere();
 
   mesh.geometry.dispose(); mesh.geometry = newGeom;
+  innerMesh.geometry = newGeom;
   bbox = newGeom.boundingBox.clone();
   updateBoundaryLines(newGeom);
 
@@ -834,14 +1183,93 @@ btnClose.addEventListener("click", () => {
   updateInfo();
 });
 
-/* ===== Extrude axis change ===== */
-extrudeAxisSelect.addEventListener("change", () => {
+/* ===== Plane type change ===== */
+planeTypeSelect.addEventListener("change", () => {
+  const type = planeTypeSelect.value;
+  axisPositionControl.style.display = (type === 'x' || type === 'y' || type === 'z') ? "" : "none";
+  btnDetectPlane.style.display      = type === 'occlusal' ? "" : "none";
+  if (type !== 'occlusal') planeControls.style.display = "none";
+  // hide occlusal plane mesh when switching away
+  if (type !== 'occlusal' && occlusalPlane) {
+    scene.remove(occlusalPlane); occlusalPlane.geometry.dispose(); occlusalPlane = null;
+    occlusalNormal = null; occlusalCenter = null;
+  }
   updateExtrudePosDefault();
   updateExtrusionPlane();
+  refreshPickedPreview();
 });
 
-/* ===== Button: Extrude to plane ===== */
-btnExtrude.addEventListener("click", () => {
+/* Remove disconnected mesh islands, keeping only the largest connected component */
+function removeDisconnectedIslands(geom) {
+  const pos = geom.attributes.position;
+  const triCount = Math.floor(pos.count / 3);
+  if (triCount === 0) return geom;
+
+  const box = geom.boundingBox || new THREE.Box3().setFromBufferAttribute(pos);
+  const size = new THREE.Vector3();
+  box.getSize(size);
+  const tol = Math.max(size.x, size.y, size.z) * 1e-4 || 1e-6;
+
+  // Map quantized vertex key → triangle indices
+  const vertToTris = new Map();
+  function qv(idx) {
+    return `${Math.round(pos.getX(idx) / tol)},${Math.round(pos.getY(idx) / tol)},${Math.round(pos.getZ(idx) / tol)}`;
+  }
+  for (let tri = 0; tri < triCount; tri++) {
+    for (let v = 0; v < 3; v++) {
+      const key = qv(tri * 3 + v);
+      if (!vertToTris.has(key)) vertToTris.set(key, []);
+      vertToTris.get(key).push(tri);
+    }
+  }
+
+  // BFS — find all connected components
+  const visited = new Uint8Array(triCount);
+  const components = [];
+  for (let start = 0; start < triCount; start++) {
+    if (visited[start]) continue;
+    const component = [];
+    const queue = [start];
+    visited[start] = 1;
+    while (queue.length) {
+      const tri = queue.pop();
+      component.push(tri);
+      for (let v = 0; v < 3; v++) {
+        for (const nb of vertToTris.get(qv(tri * 3 + v))) {
+          if (!visited[nb]) { visited[nb] = 1; queue.push(nb); }
+        }
+      }
+    }
+    components.push(component);
+  }
+
+  if (components.length <= 1) return geom;
+
+  // Keep largest component
+  components.sort((a, b) => b.length - a.length);
+  const kept = components[0];
+
+  const srcPos = pos.array;
+  const srcCol = geom.attributes.color ? geom.attributes.color.array : null;
+  const newPos = new Float32Array(kept.length * 9);
+  const newCol = srcCol ? new Float32Array(kept.length * 9) : null;
+  kept.forEach((tri, i) => {
+    const s = tri * 9, d = i * 9;
+    newPos.set(srcPos.subarray(s, s + 9), d);
+    if (newCol) newCol.set(srcCol.subarray(s, s + 9), d);
+  });
+
+  const out = new THREE.BufferGeometry();
+  out.setAttribute("position", new THREE.Float32BufferAttribute(newPos, 3));
+  if (newCol) out.setAttribute("color", new THREE.Float32BufferAttribute(newCol, 3));
+  out.computeVertexNormals();
+  out.computeBoundingBox();
+  out.computeBoundingSphere();
+  return out;
+}
+
+/* ===== Extrude core (supports any plane: normal + point) ===== */
+function performExtrude(projectFn, planeNormal, planePoint, description) {
   if (!mesh) return;
 
   if (preExtrusionState) {
@@ -851,35 +1279,24 @@ btnExtrude.addEventListener("click", () => {
     preExtrusionState = captureState();
   }
 
-  const axis = extrudeAxisSelect.value;
-  const planeVal = parseFloat(extrudePosRange.value) || 0;
-
-  function project(p) {
-    if (axis === 'z') return new THREE.Vector3(p.x, p.y, planeVal);
-    if (axis === 'y') return new THREE.Vector3(p.x, planeVal, p.z);
-    return new THREE.Vector3(planeVal, p.y, p.z);
-  }
-
   const pos = mesh.geometry.attributes.position;
   const triCount = Math.floor(pos.count / 3);
-
   const size = new THREE.Vector3();
   bbox.getSize(size);
   const tol = Math.max(size.x, size.y, size.z) * 1e-4;
 
   function qv(idx) {
-    return `${Math.round(pos.getX(idx) / tol)},${Math.round(pos.getY(idx) / tol)},${Math.round(pos.getZ(idx) / tol)}`;
+    return `${Math.round(pos.getX(idx)/tol)},${Math.round(pos.getY(idx)/tol)},${Math.round(pos.getZ(idx)/tol)}`;
   }
   function qvVec(v) {
-    return `${Math.round(v.x / tol)},${Math.round(v.y / tol)},${Math.round(v.z / tol)}`;
+    return `${Math.round(v.x/tol)},${Math.round(v.y/tol)},${Math.round(v.z/tol)}`;
   }
 
   const edgeMap = new Map();
   for (let tri = 0; tri < triCount; tri++) {
     const base = tri * 3;
     for (let e = 0; e < 3; e++) {
-      const vA = base + e;
-      const vB = base + (e + 1) % 3;
+      const vA = base + e, vB = base + (e+1) % 3;
       const kA = qv(vA), kB = qv(vB);
       const key = kA < kB ? `${kA}||${kB}` : `${kB}||${kA}`;
       if (!edgeMap.has(key)) edgeMap.set(key, []);
@@ -896,21 +1313,16 @@ btnExtrude.addEventListener("click", () => {
     const { vA, vB } = entries[0];
     const P = new THREE.Vector3(pos.getX(vA), pos.getY(vA), pos.getZ(vA));
     const Q = new THREE.Vector3(pos.getX(vB), pos.getY(vB), pos.getZ(vB));
-    const Pp = project(P), Qp = project(Q);
-
+    const Pp = projectFn(P), Qp = projectFn(Q);
     newVerts.push(P.x, P.y, P.z,  Pp.x, Pp.y, Pp.z,  Q.x, Q.y, Q.z);
     newVerts.push(Q.x, Q.y, Q.z,  Pp.x, Pp.y, Pp.z,  Qp.x, Qp.y, Qp.z);
-
     const kA = qvVec(P), kB = qvVec(Q);
     vertPos.set(kA, P); vertPos.set(kB, Q);
     if (!dirAdj.has(kA)) dirAdj.set(kA, []);
     dirAdj.get(kA).push(kB);
   });
 
-  if (!newVerts.length) {
-    infoEl.textContent = "The mesh has no open edges to extrude.";
-    return;
-  }
+  if (!newVerts.length) { infoEl.textContent = "The mesh has no open edges to extrude."; return; }
 
   const visitedKeys = new Set();
   const loops = [];
@@ -922,8 +1334,7 @@ btnExtrude.addEventListener("click", () => {
       if (visitedKeys.has(cur)) break;
       visitedKeys.add(cur);
       loop.push(vertPos.get(cur));
-      const nexts = dirAdj.get(cur) || [];
-      const next = nexts.find(k => !visitedKeys.has(k));
+      const next = (dirAdj.get(cur) || []).find(k => !visitedKeys.has(k));
       if (!next) break;
       cur = next;
     }
@@ -932,72 +1343,148 @@ btnExtrude.addEventListener("click", () => {
 
   const meshCenter = new THREE.Vector3();
   bbox.getCenter(meshCenter);
-  const meshAxisVal = axis === 'z' ? meshCenter.z : axis === 'y' ? meshCenter.y : meshCenter.x;
-  const expectedAxisSign = Math.sign(planeVal - meshAxisVal);
+  const expectedAxisSign = Math.sign(planePoint.clone().sub(meshCenter).dot(planeNormal));
 
   for (const loop of loops) {
-    const capVerts = triangulateLoop3D(loop.map(p => project(p)));
+    const capVerts = triangulateLoop3D(loop.map(p => projectFn(p)));
     if (capVerts.length < 9) continue;
-
     const ta = new THREE.Vector3(capVerts[0], capVerts[1], capVerts[2]);
     const tb = new THREE.Vector3(capVerts[3], capVerts[4], capVerts[5]);
     const tc = new THREE.Vector3(capVerts[6], capVerts[7], capVerts[8]);
     const capNorm = new THREE.Vector3().crossVectors(tb.clone().sub(ta), tc.clone().sub(ta));
-    const actualSign = axis === 'z' ? Math.sign(capNorm.z)
-                     : axis === 'y' ? Math.sign(capNorm.y)
-                     : Math.sign(capNorm.x);
-
+    const actualSign = Math.sign(capNorm.dot(planeNormal));
     if (expectedAxisSign !== 0 && actualSign !== 0 && actualSign !== expectedAxisSign) {
       for (let i = 0; i < capVerts.length; i += 9) {
         for (let k = 0; k < 3; k++) {
-          const tmp = capVerts[i + 3 + k];
-          capVerts[i + 3 + k] = capVerts[i + 6 + k];
-          capVerts[i + 6 + k] = tmp;
+          const tmp = capVerts[i+3+k]; capVerts[i+3+k] = capVerts[i+6+k]; capVerts[i+6+k] = tmp;
         }
       }
     }
-
     newVerts.push(...capVerts);
   }
 
-  if (!newVerts.length) {
-    infoEl.textContent = "Could not generate the extrusion.";
-    return;
-  }
+  if (!newVerts.length) { infoEl.textContent = "Could not generate the extrusion."; return; }
 
   const existingPos = pos.array;
   const existingCol = mesh.geometry.attributes.color.array;
   const capVertCount = newVerts.length / 3;
   const capCol = new Float32Array(capVertCount * 3);
   for (let i = 0; i < capVertCount; i++) {
-    capCol[i * 3] = BASE_COLOR.r; capCol[i * 3 + 1] = BASE_COLOR.g; capCol[i * 3 + 2] = BASE_COLOR.b;
+    capCol[i*3] = BASE_COLOR.r; capCol[i*3+1] = BASE_COLOR.g; capCol[i*3+2] = BASE_COLOR.b;
   }
 
   const allPos = new Float32Array(existingPos.length + newVerts.length);
-  allPos.set(existingPos);
-  allPos.set(newVerts, existingPos.length);
-
+  allPos.set(existingPos); allPos.set(newVerts, existingPos.length);
   const allCol = new Float32Array(existingCol.length + capCol.length);
-  allCol.set(existingCol);
-  allCol.set(capCol, existingCol.length);
+  allCol.set(existingCol); allCol.set(capCol, existingCol.length);
 
-  const newGeom = new THREE.BufferGeometry();
+  let newGeom = new THREE.BufferGeometry();
   newGeom.setAttribute("position", new THREE.Float32BufferAttribute(allPos, 3));
   newGeom.setAttribute("color",    new THREE.Float32BufferAttribute(allCol, 3));
   newGeom.computeVertexNormals();
   newGeom.computeBoundingBox();
   newGeom.computeBoundingSphere();
-
+  newGeom = removeDisconnectedIslands(newGeom);
   mesh.geometry.dispose();
   mesh.geometry = newGeom;
+  innerMesh.geometry = newGeom;
   bbox = newGeom.boundingBox.clone();
-
-  updateBoundaryLines(newGeom);
+  clearBoundaryLines();
   updateExtrusionPlane();
 
   const newTris = newVerts.length / 9;
-  infoEl.textContent = `Extruded to ${axis.toUpperCase()}=${planeVal.toFixed(2)} (${loops.length} loop(s), ${newTris} new triangles).`;
+  infoEl.textContent = `Extruded to ${description} (${loops.length} loop(s), ${newTris} new triangles).`;
   updateInfo();
+}
+
+/* ===== Button: Auto base ===== */
+btnAutoBase.addEventListener("click", () => {
+  if (!mesh) return;
+  withSpinner(() => {
+    // Ensure occlusal normal is available
+    if (!occlusalNormal) {
+      const result = runOcclusalDetection();
+      occlusalNormal = result.normal;
+      occlusalCenter = result.center.clone();
+    }
+    const N = occlusalNormal.clone().normalize();
+    const pos = mesh.geometry.attributes.position;
+    const triCount = Math.floor(pos.count / 3);
+
+    // Full range of the model along N
+    let minD = Infinity, maxD = -Infinity;
+    for (let i = 0; i < pos.count; i++) {
+      const d = pos.getX(i) * N.x + pos.getY(i) * N.y + pos.getZ(i) * N.z;
+      if (d < minD) minD = d;
+      if (d > maxD) maxD = d;
+    }
+
+    // Detect boundary (open) edges and find mean projection of their vertices along N
+    const box = mesh.geometry.boundingBox || new THREE.Box3().setFromBufferAttribute(pos);
+    const sz = new THREE.Vector3(); box.getSize(sz);
+    const tol = Math.max(sz.x, sz.y, sz.z) * 1e-4 || 1e-6;
+    function qv(idx) {
+      return `${Math.round(pos.getX(idx)/tol)},${Math.round(pos.getY(idx)/tol)},${Math.round(pos.getZ(idx)/tol)}`;
+    }
+    const edgeMap = new Map();
+    for (let tri = 0; tri < triCount; tri++) {
+      for (let e = 0; e < 3; e++) {
+        const vA = tri * 3 + e, vB = tri * 3 + (e + 1) % 3;
+        const kA = qv(vA), kB = qv(vB);
+        const key = kA < kB ? `${kA}||${kB}` : `${kB}||${kA}`;
+        if (!edgeMap.has(key)) edgeMap.set(key, { vA, vB, count: 0 });
+        edgeMap.get(key).count++;
+      }
+    }
+    let boundarySum = 0, boundaryN = 0;
+    edgeMap.forEach(({ vA, vB, count }) => {
+      if (count !== 1) return;
+      boundarySum += pos.getX(vA)*N.x + pos.getY(vA)*N.y + pos.getZ(vA)*N.z;
+      boundarySum += pos.getX(vB)*N.x + pos.getY(vB)*N.y + pos.getZ(vB)*N.z;
+      boundaryN += 2;
+    });
+
+    // Upper arch: boundary is above the mesh midpoint (base at top, occlusal at bottom)
+    const mid = (minD + maxD) / 2;
+    const boundaryMean = boundaryN > 0 ? boundarySum / boundaryN : minD;
+    const baseAtTop = boundaryMean > mid;
+
+    const planeD = baseAtTop ? maxD + 10 : minD - 10;
+    const C = N.clone().multiplyScalar(planeD);
+    const label = baseAtTop ? 'upper arch +10 mm' : 'lower arch −10 mm';
+
+    performExtrude(
+      p => p.clone().addScaledVector(N, -(p.clone().sub(C).dot(N))),
+      N, C,
+      `auto base (${label})`
+    );
+  });
+});
+
+/* ===== Button: Extrude to plane ===== */
+btnExtrude.addEventListener("click", () => {
+  if (!mesh) return;
+  const type = planeTypeSelect.value;
+  if (type === 'none') return;
+
+  withSpinner(() => {
+    if (type === 'occlusal') {
+      if (!occlusalNormal) { infoEl.textContent = "Detect the occlusal plane first."; return; }
+      const N = occlusalNormal.clone();
+      const C = occlusalCenter ? occlusalCenter.clone().addScaledVector(N, parseFloat(planeOffsetRange.value) || 0)
+                                : (occlusalPlane ? occlusalPlane.position.clone() : new THREE.Vector3());
+      performExtrude(p => p.clone().addScaledVector(N, -(p.clone().sub(C).dot(N))), N, C,
+        `occlusal plane (offset ${parseFloat(planeOffsetRange.value).toFixed(1)})`);
+    } else {
+      const planeVal = parseFloat(extrudePosRange.value) || 0;
+      const N = type === 'y' ? new THREE.Vector3(0,1,0)
+              : type === 'z' ? new THREE.Vector3(0,0,1)
+              :                new THREE.Vector3(1,0,0);
+      const C = N.clone().multiplyScalar(planeVal);
+      performExtrude(p => p.clone().addScaledVector(N, -(p.clone().sub(C).dot(N))), N, C,
+        `${type.toUpperCase()}=${planeVal.toFixed(2)}`);
+    }
+  });
 });
 
 /* ===== Pick text point button ===== */
@@ -1006,15 +1493,17 @@ btnPickTextPoint.addEventListener("click", () => {
   if (isPickingTextPoint) {
     isPickingTextPoint = false;
     btnPickTextPoint.classList.remove("active");
-    orbitControls.enabled = true;
     renderer.domElement.style.cursor = "";
     pickInfo.textContent = currentHoverHit ? "Point set" : "No point picked";
+    clearPickRect();
   } else {
     isPickingTextPoint = true;
     btnPickTextPoint.classList.add("active");
     pickInfo.textContent = "Click on the mesh…";
-    orbitControls.enabled = false;
     renderer.domElement.style.cursor = "crosshair";
+    computePickRectDims();
+    // If font not loaded yet, load it silently so dims are ready when the user hovers
+    if (!font) ensureFontLoaded().then(() => { if (isPickingTextPoint) computePickRectDims(); });
   }
 });
 
@@ -1022,13 +1511,34 @@ btnPickTextPoint.addEventListener("click", () => {
 function refreshPickedPreview() {
   if (currentHoverHit && font && bbox) {
     previewParamsKey = ""; // force geometry rebuild
-    updateHoverPreview();
+    withSpinner(() => updateHoverPreview());
   }
 }
-[textInput, sizeRange, depthRange].forEach(el => {
-  el.addEventListener("input", refreshPickedPreview);
+// Text field: show "Update preview" button instead of live refresh when a point is picked
+textInput.addEventListener("input", () => {
+  if (isPickingTextPoint) computePickRectDims();
+  if (currentHoverHit) {
+    btnUpdateTextPreview.style.display = "";
+  } else {
+    refreshPickedPreview();
+  }
 });
-extrudeAxisSelect.addEventListener("change", refreshPickedPreview);
+
+// Size / depth sliders still refresh live
+[sizeRange, depthRange].forEach(el => {
+  el.addEventListener("input", () => {
+    if (isPickingTextPoint) computePickRectDims();
+    refreshPickedPreview();
+  });
+});
+
+btnUpdateTextPreview.addEventListener("click", () => {
+  btnUpdateTextPreview.style.display = "none";
+  if (isPickingTextPoint) computePickRectDims();
+  refreshPickedPreview();
+});
+
+planeTypeSelect.addEventListener("change", refreshPickedPreview);
 
 /* ===== Emboss ===== */
 
@@ -1042,27 +1552,43 @@ function ensureFontLoaded() {
 }
 
 /* Compute text placement transform.
-   - Extrusion direction (n): surface normal projected onto XZ plane → always ⊥ world Y.
-   - yAxis: world Y → letters stand upright.
-   - xAxis: cross(Y, n) → reading direction, horizontal, given by pick location.
+   - UP: occlusal normal if detected, otherwise the selected plane axis (Y/Z/X), or world Y.
+   - Extrusion direction (n): surface normal projected onto plane ⊥ UP.
+   - xAxis: cross(UP, n) → reading direction.
 */
 function getTextTransform() {
-  const UP = new THREE.Vector3(0, 1, 0);
+  // Derive UP from active plane: occlusal normal, or the selected axis, or world Y fallback
+  let UP;
+  if (occlusalNormal && occlusalNormal.lengthSq() > 0.5) {
+    UP = occlusalNormal.clone().normalize();
+  } else {
+    const axis = planeTypeSelect.value;
+    if      (axis === 'y') UP = new THREE.Vector3(0, 1, 0);
+    else if (axis === 'z') UP = new THREE.Vector3(0, 0, 1);
+    else if (axis === 'x') UP = new THREE.Vector3(1, 0, 0);
+    else                   UP = new THREE.Vector3(0, 1, 0); // 'none' fallback
+  }
   let n;
 
   if (currentHoverHit && currentHoverHit.face) {
-    // Project surface normal onto XZ plane so n ⊥ world Y
+    // Project surface normal onto plane ⊥ UP so n ⊥ UP
     const sn = currentHoverHit.face.normal.clone().transformDirection(mesh.matrixWorld);
-    n = new THREE.Vector3(sn.x, 0, sn.z);
-    if (n.lengthSq() < 0.001) n.set(1, 0, 0); // nearly-horizontal surface fallback
+    n = sn.clone().addScaledVector(UP, -sn.dot(UP));
+    if (n.lengthSq() < 0.001) {
+      // Surface nearly parallel to UP — pick an arbitrary perpendicular
+      n = new THREE.Vector3(Math.abs(UP.x) < 0.9 ? 1 : 0, 0, Math.abs(UP.x) < 0.9 ? 0 : 1);
+      n.addScaledVector(UP, -n.dot(UP));
+    }
     n.normalize();
   } else {
-    // No pick yet — default to a horizontal direction from axis selector
-    const axis = extrudeAxisSelect.value;
+    // No pick yet — default to a direction from plane type selector, projected ⊥ UP
+    const axis = planeTypeSelect.value;
     n = axis === 'x' ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 0, 1);
+    n.addScaledVector(UP, -n.dot(UP));
+    if (n.lengthSq() < 0.001) n.set(0, 0, 1);
+    n.normalize();
   }
 
-  // n ⊥ Y guaranteed → cross(Y, n) is always valid and horizontal
   const xAxis = new THREE.Vector3().crossVectors(UP, n).normalize();
   // basis: (xAxis, Y, n) is right-handed when n ⊥ Y
   const quat = new THREE.Quaternion().setFromRotationMatrix(
@@ -1075,7 +1601,7 @@ function getTextTransform() {
   } else {
     origin = new THREE.Vector3();
     bbox.getCenter(origin);
-    const axis = extrudeAxisSelect.value;
+    const axis = planeTypeSelect.value;
     if (axis === 'x') origin.x = bbox.max.x;
     else origin.z = bbox.max.z;
   }
@@ -1089,7 +1615,7 @@ function buildTextMesh() {
   const depth = Number(depthRange.value) || 1;
 
   const geom = new TextGeometry(text, {
-    font, size, height: depth, curveSegments: 8, bevelEnabled: false,
+    font, size, height: depth * 1.5, curveSegments: 8, bevelEnabled: false,
   });
   geom.computeBoundingBox();
   const c = new THREE.Vector3();
@@ -1152,11 +1678,11 @@ function conformTextGeometryToMesh(geom, n, depth, textCenter) {
     }
 
     const surf = cache.get(key);
-    // Offset so back face (dz = -depth/2) sits slightly INSIDE the mesh (by 15% of depth).
-    // This guarantees a clean CSG union with no coplanar / interior triangles.
-    // front face (dz = +depth/2) protrudes by ~85% of depth above the surface.
-    const penetration = depth * 0.15;
-    const np = surf.clone().addScaledVector(n, dz + depth * 0.5 - penetration);
+    // Text height = depth * 1.5 → dz ranges [-0.75·depth, +0.75·depth]
+    // Formula: np = surf + (dz + depth·0.25)·n
+    //   front face (dz=+0.75·depth): protrudes +depth above surface
+    //   back  face (dz=-0.75·depth): goes -0.5·depth inside mesh (clean CSG)
+    const np = surf.clone().addScaledVector(n, dz + depth * 0.25);
     pos.setXYZ(i, np.x, np.y, np.z);
   }
 
@@ -1176,7 +1702,87 @@ async function buildTextGeometryWorld() {
   return sanitizeGeometryForCSG(g);
 }
 
+function clearPickRect() {
+  if (pickRectMesh) {
+    scene.remove(pickRectMesh);
+    pickRectMesh.geometry.dispose();
+    pickRectMesh = null;
+  }
+}
+
+// Compute text bounding box dims from font (synchronous if font already loaded)
+function computePickRectDims() {
+  if (!font) { pickRectDims = null; return; }
+  const text  = (textInput.value || "").trim() || "TEXT";
+  const size  = Number(sizeRange.value)  || 2;
+  const depth = Number(depthRange.value) || 1;
+  const tg = new TextGeometry(text, { font, size, height: depth * 1.5, curveSegments: 4, bevelEnabled: false });
+  tg.computeBoundingBox();
+  const bb = tg.boundingBox;
+  pickRectDims = { w: bb.max.x - bb.min.x, h: bb.max.y - bb.min.y };
+  tg.dispose();
+}
+
+// Update (or create) the rectangle outline at a hover hit during pick mode
+function updatePickRect(hit) {
+  if (!hit || !isPickingTextPoint || !pickRectDims) { clearPickRect(); return; }
+  const { w, h } = pickRectDims;
+
+  // Same UP logic as getTextTransform
+  let UP;
+  if (occlusalNormal && occlusalNormal.lengthSq() > 0.5) {
+    UP = occlusalNormal.clone().normalize();
+  } else {
+    const axis = planeTypeSelect.value;
+    if      (axis === 'y') UP = new THREE.Vector3(0, 1, 0);
+    else if (axis === 'z') UP = new THREE.Vector3(0, 0, 1);
+    else if (axis === 'x') UP = new THREE.Vector3(1, 0, 0);
+    else                   UP = new THREE.Vector3(0, 1, 0);
+  }
+
+  // Extrusion direction n: surface normal projected ⊥ UP
+  const sn = hit.face.normal.clone().transformDirection(mesh.matrixWorld);
+  let n = sn.clone().addScaledVector(UP, -sn.dot(UP));
+  if (n.lengthSq() < 0.001) {
+    n = new THREE.Vector3(Math.abs(UP.x) < 0.9 ? 1 : 0, 0, Math.abs(UP.x) < 0.9 ? 0 : 1);
+    n.addScaledVector(UP, -n.dot(UP));
+  }
+  n.normalize();
+  const xAxis = new THREE.Vector3().crossVectors(UP, n).normalize();
+
+  // Four corners of the bbox rectangle, offset slightly along hit normal to avoid z-fighting
+  const origin = hit.point.clone().addScaledVector(sn, 0.05);
+  const hw = w / 2, hh = h / 2;
+  const corners = [
+    origin.clone().addScaledVector(xAxis, -hw).addScaledVector(UP, -hh),
+    origin.clone().addScaledVector(xAxis,  hw).addScaledVector(UP, -hh),
+    origin.clone().addScaledVector(xAxis,  hw).addScaledVector(UP,  hh),
+    origin.clone().addScaledVector(xAxis, -hw).addScaledVector(UP,  hh),
+  ];
+
+  // 4 edges as pairs
+  const verts = new Float32Array([
+    ...corners[0].toArray(), ...corners[1].toArray(),
+    ...corners[1].toArray(), ...corners[2].toArray(),
+    ...corners[2].toArray(), ...corners[3].toArray(),
+    ...corners[3].toArray(), ...corners[0].toArray(),
+  ]);
+
+  if (!pickRectMesh) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
+    pickRectMesh = new THREE.LineSegments(geo,
+      new THREE.LineBasicMaterial({ color: 0x00d4ff, depthTest: false }));
+    pickRectMesh.renderOrder = 999;
+    scene.add(pickRectMesh);
+  } else {
+    pickRectMesh.geometry.attributes.position.array.set(verts);
+    pickRectMesh.geometry.attributes.position.needsUpdate = true;
+  }
+}
+
 function clearPreview() {
+  clearPickRect();
   if (previewTextMesh) {
     scene.remove(previewTextMesh);
     previewTextMesh.geometry.dispose();
@@ -1201,7 +1807,7 @@ function updateHoverPreview() {
     const text  = (textInput.value || "").trim() || "TEXT";
     const size  = Number(sizeRange.value)  || 2;
     const depth = Number(depthRange.value) || 1;
-    const tgeom = new TextGeometry(text, { font, size, height: depth, curveSegments: 8, bevelEnabled: false });
+    const tgeom = new TextGeometry(text, { font, size, height: depth * 1.5, curveSegments: 8, bevelEnabled: false });
     tgeom.computeBoundingBox();
     const c = new THREE.Vector3();
     tgeom.boundingBox.getCenter(c);
@@ -1227,6 +1833,84 @@ function updateHoverPreview() {
   previewTextMesh.visible = true;
 }
 
+/* Remove zero/near-zero area triangles from a non-indexed geometry */
+function removeDegenerateTris(geom) {
+  const pos = geom.attributes.position;
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  const verts = [];
+  const MIN_AREA_SQ = 1e-12;
+  for (let i = 0; i < pos.count; i += 3) {
+    a.fromBufferAttribute(pos, i);
+    b.fromBufferAttribute(pos, i + 1);
+    c.fromBufferAttribute(pos, i + 2);
+    const areaSq = b.clone().sub(a).cross(c.clone().sub(a)).lengthSq();
+    if (areaSq > MIN_AREA_SQ) verts.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+  }
+  if (verts.length === pos.count * 3) return geom;
+  const out = new THREE.BufferGeometry();
+  out.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
+  out.computeVertexNormals();
+  out.computeBoundingBox();
+  out.computeBoundingSphere();
+  return out;
+}
+
+/* Auto-clean a freshly loaded mesh: degenerate tris → duplicate tris → islands.
+   Returns { geom, removed } where removed is a summary string (empty if nothing changed). */
+function autoCleanMesh(geom) {
+  const before = Math.floor(geom.attributes.position.count / 3);
+  const msgs = [];
+
+  // 1. Degenerate triangles
+  const afterDegen = removeDegenerateTris(geom);
+  const degenRemoved = before - Math.floor(afterDegen.attributes.position.count / 3);
+  if (degenRemoved > 0) msgs.push(`${degenRemoved} degenerate`);
+  geom = afterDegen;
+
+  // 2. Duplicate triangles (same 3 positions, any winding)
+  {
+    const pos = geom.attributes.position;
+    const triCount = Math.floor(pos.count / 3);
+    const box = geom.boundingBox || new THREE.Box3().setFromBufferAttribute(pos);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const tol = Math.max(size.x, size.y, size.z) * 1e-4 || 1e-6;
+    function qv(idx) {
+      return `${Math.round(pos.getX(idx) / tol)},${Math.round(pos.getY(idx) / tol)},${Math.round(pos.getZ(idx) / tol)}`;
+    }
+    const seen = new Set();
+    const keep = [];
+    for (let tri = 0; tri < triCount; tri++) {
+      const keys = [qv(tri * 3), qv(tri * 3 + 1), qv(tri * 3 + 2)].sort();
+      const key = keys.join('|');
+      if (!seen.has(key)) { seen.add(key); keep.push(tri); }
+    }
+    if (keep.length < triCount) {
+      const src = pos.array;
+      const newPos = new Float32Array(keep.length * 9);
+      keep.forEach((tri, i) => newPos.set(src.subarray(tri * 9, tri * 9 + 9), i * 9));
+      const g2 = new THREE.BufferGeometry();
+      g2.setAttribute("position", new THREE.Float32BufferAttribute(newPos, 3));
+      g2.computeVertexNormals();
+      g2.computeBoundingBox();
+      g2.computeBoundingSphere();
+      msgs.push(`${triCount - keep.length} duplicate`);
+      geom = g2;
+    }
+  }
+
+  // 3. Disconnected islands — keep only largest component
+  {
+    const beforeIsland = Math.floor(geom.attributes.position.count / 3);
+    const cleaned = removeDisconnectedIslands(geom);
+    const islandRemoved = beforeIsland - Math.floor(cleaned.attributes.position.count / 3);
+    if (islandRemoved > 0) msgs.push(`${islandRemoved} island tris`);
+    geom = cleaned;
+  }
+
+  return { geom, removed: msgs.length ? `Cleaned: ${msgs.join(', ')} removed.` : "" };
+}
+
 async function applyTextCSG() {
   if (!mesh || !bbox) return;
   await ensureFontLoaded();
@@ -1245,17 +1929,19 @@ async function applyTextCSG() {
   resultGeom.computeBoundingBox();
   resultGeom.computeBoundingSphere();
 
-  // Convert to non-indexed and add vertex colors
+  // Convert to non-indexed, remove degenerate triangles, add vertex colors
   let finalGeom = resultGeom;
   if (finalGeom.index) finalGeom = finalGeom.toNonIndexed();
+  finalGeom = removeDegenerateTris(finalGeom);
   initVertexColors(finalGeom);
   selectedSet.clear();
 
   mesh.geometry.dispose();
   mesh.geometry = finalGeom;
+  innerMesh.geometry = finalGeom;
   bbox = finalGeom.boundingBox ? finalGeom.boundingBox.clone() : new THREE.Box3().setFromBufferAttribute(finalGeom.attributes.position);
 
-  updateBoundaryLines(finalGeom);
+  clearBoundaryLines();
 
   const total = Math.floor(finalGeom.attributes.position.count / 3);
   infoEl.textContent = `Emboss applied | Triangles: ${total.toLocaleString()}`;
@@ -1264,10 +1950,14 @@ async function applyTextCSG() {
 
 /* ===== Button: Apply CSG ===== */
 btnApplyText.addEventListener("click", () => {
-  applyTextCSG().catch((e) => {
-    console.error(e);
-    infoEl.textContent = "Error applying CSG (see console).";
-  });
+  showSpinner();
+  // Double-rAF ensures spinner is painted before synchronous heavy work (raycasts + CSG) blocks the thread
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    applyTextCSG().catch((e) => {
+      console.error(e);
+      infoEl.textContent = "Error applying CSG (see console).";
+    }).finally(() => hideSpinner());
+  }));
 });
 
 /* ===== Button: Reset to original ===== */
@@ -1287,6 +1977,7 @@ btnReset.addEventListener("click", () => {
 
   mesh.geometry.dispose();
   mesh.geometry = finalGeom;
+  innerMesh.geometry = finalGeom;
   bbox = finalGeom.boundingBox.clone();
 
   updateBoundaryLines(finalGeom);
@@ -1322,20 +2013,75 @@ stlInput.addEventListener("change", (e) => {
 });
 
 /* ===== Load file ===== */
+const objLoader = new OBJLoader();
+
 function loadFile(file) {
+  const ext = file.name.split('.').pop().toLowerCase();
   const reader = new FileReader();
-  reader.onload = (e) => loadGeometryFromBuffer(e.target.result, file.name);
-  reader.readAsArrayBuffer(file);
+  if (ext === 'obj') {
+    reader.onload = (e) => {
+      const text = e.target.result;
+
+      // Parse face→vertex indices directly from OBJ text (0-based, triangulated).
+      // This guarantees correspondence with the labels array regardless of how
+      // OBJLoader handles vertex deduplication or normal splitting.
+      const faceIndices = [];
+      for (const line of text.split('\n')) {
+        const t = line.trim();
+        if (!t.startsWith('f ')) continue;
+        const verts = t.split(/\s+/).slice(1).map(tok => parseInt(tok.split('/')[0]) - 1);
+        for (let i = 1; i < verts.length - 1; i++) {
+          faceIndices.push(verts[0], verts[i], verts[i + 1]);
+        }
+      }
+      objOriginalIndices = faceIndices.length ? new Int32Array(faceIndices) : null;
+
+      const group = objLoader.parse(text);
+      const geos = [];
+      group.traverse((child) => {
+        if (child.isMesh && child.geometry) {
+          let g = child.geometry.index ? child.geometry.toNonIndexed() : child.geometry.clone();
+          if (!g.attributes.normal) g.computeVertexNormals();
+          geos.push(g);
+        }
+      });
+      if (!geos.length) { infoEl.textContent = "No geometry found in OBJ file."; return; }
+      const merged = geos.length === 1 ? geos[0] : mergeGeometries(geos, false);
+      merged.computeVertexNormals();
+      merged.computeBoundingBox();
+      merged.computeBoundingSphere();
+      segmentationColors = null;
+      segSection.style.display = "";
+      segInfo.textContent = "No segmentation loaded";
+      loadGeometryFromParsed(merged, file.name);
+    };
+    reader.readAsText(file);
+  } else {
+    objOriginalIndices = null;
+    segmentationColors = null;
+    segSection.style.display = "none";
+    reader.onload = (e) => loadGeometryFromBuffer(e.target.result, file.name);
+    reader.readAsArrayBuffer(file);
+  }
 }
 
 function loadGeometryFromBuffer(buffer, filename) {
-  loadedFilename = filename.replace(/\.stl$/i, "");
   let geometry = loader.parse(buffer);
   geometry.computeVertexNormals();
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
-
   if (geometry.index) geometry = geometry.toNonIndexed();
+  loadGeometryFromParsed(geometry, filename);
+}
+
+function loadGeometryFromParsed(geometry, filename) {
+  loadedFilename = filename.replace(/\.(stl|obj)$/i, "");
+  textInput.value = loadedFilename;
+  if (geometry.index) geometry = geometry.toNonIndexed();
+
+  // Auto-clean: degenerate + duplicate tris, disconnected islands
+  const { geom: cleanGeom, removed: cleanMsg } = autoCleanMesh(geometry);
+  geometry = cleanGeom;
 
   initVertexColors(geometry);
 
@@ -1344,6 +2090,11 @@ function loadGeometryFromBuffer(buffer, filename) {
 
   // Store original for reset
   originalGeometry = geometry.clone();
+
+  // Reset occlusal plane on new load
+  if (occlusalPlane) { scene.remove(occlusalPlane); occlusalPlane.geometry.dispose(); occlusalPlane = null; }
+  occlusalNormal = null; occlusalCenter = null;
+  planeControls.style.display = "none";
 
   if (mesh) {
     scene.remove(mesh);
@@ -1370,6 +2121,7 @@ function loadGeometryFromBuffer(buffer, filename) {
   currentHoverHit = null;
   isPickingTextPoint = false;
   btnPickTextPoint.classList.remove("active");
+  btnUpdateTextPreview.style.display = "none";
   pickInfo.textContent = "No point picked";
   orbitControls.enabled = true;
   renderer.domElement.style.cursor = "";
@@ -1380,7 +2132,7 @@ function loadGeometryFromBuffer(buffer, filename) {
   updateExtrudePosDefault();
 
   const total = Math.floor(geometry.attributes.position.count / 3);
-  infoEl.textContent = `Loaded: ${filename} | Triangles: ${total.toLocaleString()}`;
+  infoEl.textContent = `Loaded: ${filename} | Triangles: ${total.toLocaleString()}${cleanMsg ? ' | ' + cleanMsg : ''}`;
   updateInfo();
 }
 
@@ -1424,7 +2176,7 @@ window.addEventListener("keydown", (e) => {
     btnDelete.click();
   } else if (e.key === "Escape") {
     e.preventDefault();
-    btnClear.click();
+    clearSelection();
   } else if (e.key === "z" && e.ctrlKey && !e.shiftKey) {
     e.preventDefault();
     btnUndo.click();
