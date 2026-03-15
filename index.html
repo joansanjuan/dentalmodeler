@@ -61,6 +61,10 @@
               <i data-lucide="type"></i>
               <span>Text</span>
             </button>
+            <button class="mode-btn" data-mode="test" type="button" title="Debug / test tools">
+              <i data-lucide="flask-conical"></i>
+              <span>Test</span>
+            </button>
           </div>
 
           <!-- AUTO panel -->
@@ -69,6 +73,19 @@
               <p class="mode-hint">Automatically extrudes the model to a flat base plane aligned with the occlusal.</p>
               <button id="btnAutoBase" class="btn btn--full" type="button" disabled>
                 <i data-lucide="wand-2"></i> Auto base
+              </button>
+            </div>
+            <div class="panel-section">
+              <p class="mode-hint">Creates a hollow shell. The bottom face stays open. Run Auto base first.</p>
+              <label class="control">
+                <span>Wall thickness</span>
+                <div class="hollow-row">
+                  <input type="number" id="hollowThicknessInput" value="2" min="0.5" max="10" step="0.1" disabled />
+                  <span class="hollow-unit">mm</span>
+                </div>
+              </label>
+              <button id="btnHollow" class="btn btn--ghost btn--full" type="button" disabled>
+                <i data-lucide="box"></i> Make hollow
               </button>
             </div>
           </div>
@@ -190,6 +207,46 @@
               </div>
             </div>
           </div><!-- /text panel -->
+
+          <!-- TEST panel -->
+          <div class="mode-panel" data-mode="test" style="display:none">
+            <div class="panel-section">
+              <span class="section-label">Voxelization</span>
+              <p class="mode-hint">Visualizes the 3D occupancy grid used to detect thin zones. Hollow-eligible voxels shown in blue.</p>
+              <label class="control">
+                <span>Voxel size</span>
+                <div class="hollow-row">
+                  <input type="number" id="voxelSizeInput" value="0.5" min="0.1" max="2" step="0.1" disabled />
+                  <span class="hollow-unit">mm</span>
+                </div>
+              </label>
+              <label class="control">
+                <span>Test thickness</span>
+                <div class="hollow-row">
+                  <input type="number" id="voxelThicknessInput" value="2" min="0.5" max="10" step="0.1" disabled />
+                  <span class="hollow-unit">mm</span>
+                </div>
+              </label>
+              <button id="btnTestVoxel" class="btn btn--ghost btn--full" type="button" disabled>
+                <i data-lucide="box-select"></i> Show voxels
+              </button>
+              <button id="btnClearVoxel" class="btn btn--ghost btn--full" type="button" disabled>
+                <i data-lucide="x"></i> Clear voxels
+              </button>
+              <button id="btnToggleMesh" class="btn btn--ghost btn--full" type="button" disabled>
+                <i data-lucide="eye-off"></i> Hide model
+              </button>
+              <button id="btnDownloadVoxel" class="btn btn--ghost btn--full" type="button" disabled>
+                <i data-lucide="save"></i> Download voxel STL
+              </button>
+              <button id="btnErodeVoxel" class="btn btn--ghost btn--full" type="button" disabled>
+                <i data-lucide="minimize-2"></i> Erode surface
+              </button>
+              <button id="btnDownloadEroded" class="btn btn--ghost btn--full" type="button" disabled>
+                <i data-lucide="save"></i> Download eroded STL
+              </button>
+            </div>
+          </div>
 
           <!-- Spacer pushes download to bottom -->
           <div class="panel-spacer"></div>

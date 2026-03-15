@@ -46,6 +46,16 @@ const sizeRange        = document.getElementById("sizeRange");
 const depthRange       = document.getElementById("depthRange");
 
 const btnAutoBase           = document.getElementById("btnAutoBase");
+const btnHollow             = document.getElementById("btnHollow");
+const hollowThicknessInput  = document.getElementById("hollowThicknessInput");
+const btnTestVoxel          = document.getElementById("btnTestVoxel");
+const btnClearVoxel         = document.getElementById("btnClearVoxel");
+const btnToggleMesh         = document.getElementById("btnToggleMesh");
+const btnDownloadVoxel      = document.getElementById("btnDownloadVoxel");
+const btnErodeVoxel         = document.getElementById("btnErodeVoxel");
+const btnDownloadEroded     = document.getElementById("btnDownloadEroded");
+const voxelSizeInput        = document.getElementById("voxelSizeInput");
+const voxelThicknessInput   = document.getElementById("voxelThicknessInput");
 const btnPickTextPoint      = document.getElementById("btnPickTextPoint");
 const pickInfo              = document.getElementById("pickInfo");
 const btnApplyText          = document.getElementById("btnApplyText");
@@ -585,7 +595,16 @@ function setEnabled(enabled) {
   btnApplyText.disabled      = !enabled;
   btnReset.disabled          = !enabled;
   btnDetectPlane.disabled = !enabled;
-  btnAutoBase.disabled    = !enabled;
+  btnAutoBase.disabled           = !enabled;
+  btnHollow.disabled             = !enabled;
+  hollowThicknessInput.disabled  = !enabled;
+  btnTestVoxel.disabled          = !enabled;
+  btnClearVoxel.disabled         = !enabled;
+  btnToggleMesh.disabled         = !enabled;
+  btnDownloadVoxel.disabled      = !enabled;
+  btnErodeVoxel.disabled         = !enabled;
+  voxelSizeInput.disabled        = !enabled;
+  voxelThicknessInput.disabled   = !enabled;
   if (!enabled) { btnUndo.disabled = true; btnRedo.disabled = true; }
 }
 
@@ -1408,6 +1427,589 @@ function performExtrude(projectFn, planeNormal, planePoint, description) {
   infoEl.textContent = `Extruded to ${description} (${loops.length} loop(s), ${newTris} new triangles).`;
   updateInfo();
 }
+
+/* ===== Last voxel result (for STL download) ===== */
+let lastVoxelState = null;
+let lastVoxelGrid  = null; // { gx, gy, gz, voxSz, oX, oY, oZ }
+let lastVoxelSolid = null; // solidified version (filled interior)
+
+/* ===== Voxel → binary STL ===== */
+// Generates a blocky (Minecraft-style) mesh from the voxel occupancy.
+// A face is emitted wherever an occupied voxel (state !== 2) borders an
+// empty one (state === 2 or outside the grid).
+function voxelsToSTLBuffer(state, gx, gy, gz, voxSz, oX, oY, oZ) {
+  const isOcc = (ix, iy, iz) => {
+    if (ix<0||ix>=gx||iy<0||iy>=gy||iz<0||iz>=gz) return false;
+    return state[ix + iy*gx + iz*gx*gy] !== 2;
+  };
+
+  // Collect triangles as flat array: [nx,ny,nz, x1,y1,z1, x2,y2,z2, x3,y3,z3, ...]
+  const tris = [];
+  const quad = (nx,ny,nz, ax,ay,az, bx,by,bz, cx,cy,cz, dx,dy,dz) => {
+    tris.push(nx,ny,nz, ax,ay,az, bx,by,bz, cx,cy,cz); // tri 1: A,B,C
+    tris.push(nx,ny,nz, ax,ay,az, cx,cy,cz, dx,dy,dz); // tri 2: A,C,D
+  };
+
+  for (let iz=0; iz<gz; iz++) {
+    for (let iy=0; iy<gy; iy++) {
+      for (let ix=0; ix<gx; ix++) {
+        if (!isOcc(ix,iy,iz)) continue;
+        const x0=oX+ix*voxSz, x1=x0+voxSz;
+        const y0=oY+iy*voxSz, y1=y0+voxSz;
+        const z0=oZ+iz*voxSz, z1=z0+voxSz;
+        if (!isOcc(ix-1,iy,iz)) quad(-1,0,0, x0,y0,z0, x0,y0,z1, x0,y1,z1, x0,y1,z0);
+        if (!isOcc(ix+1,iy,iz)) quad( 1,0,0, x1,y0,z0, x1,y1,z0, x1,y1,z1, x1,y0,z1);
+        if (!isOcc(ix,iy-1,iz)) quad(0,-1,0, x0,y0,z0, x1,y0,z0, x1,y0,z1, x0,y0,z1);
+        if (!isOcc(ix,iy+1,iz)) quad(0, 1,0, x0,y1,z0, x0,y1,z1, x1,y1,z1, x1,y1,z0);
+        if (!isOcc(ix,iy,iz-1)) quad(0,0,-1, x0,y0,z0, x0,y1,z0, x1,y1,z0, x1,y0,z0);
+        if (!isOcc(ix,iy,iz+1)) quad(0,0, 1, x0,y0,z1, x1,y0,z1, x1,y1,z1, x0,y1,z1);
+      }
+    }
+  }
+
+  const nTri = tris.length / 12; // 12 floats per triangle
+  const buf  = new ArrayBuffer(80 + 4 + nTri * 50);
+  const dv   = new DataView(buf);
+  dv.setUint32(80, nTri, true);
+  let off = 84;
+  for (let t=0; t<nTri; t++) {
+    const b = t * 12;
+    for (let f=0; f<12; f++) dv.setFloat32(off + f*4, tris[b+f], true);
+    dv.setUint16(off + 48, 0, true);
+    off += 50;
+  }
+  return buf;
+}
+
+/* ===== Voxel occupancy — surface rasterisation + flood fill ===== */
+// Robust against any triangle orientation (no projection-axis degeneracy).
+//
+// Step 1 — Surface: for each triangle mark every voxel whose centre is within
+//   halfDiag (half cube space-diagonal) of the nearest point on that triangle.
+//   Uses exact point-to-triangle distance via clamped barycentric coords.
+// Step 2 — Outside: BFS from the 6 bounding-box faces through non-surface voxels.
+// Step 3 — Inside: voxels that are neither surface nor reachable from outside.
+function buildOccupancy(posArr, nTri, voxSz, oX, oY, oZ, gx, gy, gz) {
+  const total = gx * gy * gz;
+  const SURF = 1, OUT = 2;
+  const state = new Uint8Array(total);
+
+  const halfDiag = voxSz * Math.sqrt(3) * 0.5;
+  const hd2 = halfDiag * halfDiag;
+
+  // ── Step 1: rasterise triangles → surface voxels ──────────────────────────
+  for (let t = 0; t < nTri; t++) {
+    const b9 = t * 9;
+    const ax=posArr[b9],   ay=posArr[b9+1], az=posArr[b9+2];
+    const bx=posArr[b9+3], by=posArr[b9+4], bz=posArr[b9+5];
+    const cx=posArr[b9+6], cy=posArr[b9+7], cz=posArr[b9+8];
+    const ex=bx-ax, ey=by-ay, ez=bz-az; // AB
+    const fx=cx-ax, fy=cy-ay, fz=cz-az; // AC
+    const d00=ex*ex+ey*ey+ez*ez, d01=ex*fx+ey*fy+ez*fz, d11=fx*fx+fy*fy+fz*fz;
+    const den = d00*d11 - d01*d01;
+
+    const ixA=Math.max(0,    Math.floor((Math.min(ax,bx,cx)-halfDiag-oX)/voxSz));
+    const ixB=Math.min(gx-1, Math.ceil ((Math.max(ax,bx,cx)+halfDiag-oX)/voxSz));
+    const iyA=Math.max(0,    Math.floor((Math.min(ay,by,cy)-halfDiag-oY)/voxSz));
+    const iyB=Math.min(gy-1, Math.ceil ((Math.max(ay,by,cy)+halfDiag-oY)/voxSz));
+    const izA=Math.max(0,    Math.floor((Math.min(az,bz,cz)-halfDiag-oZ)/voxSz));
+    const izB=Math.min(gz-1, Math.ceil ((Math.max(az,bz,cz)+halfDiag-oZ)/voxSz));
+
+    for (let ix=ixA; ix<=ixB; ix++) {
+      const px = oX+(ix+0.5)*voxSz - ax;
+      for (let iy=iyA; iy<=iyB; iy++) {
+        const py = oY+(iy+0.5)*voxSz - ay;
+        for (let iz=izA; iz<=izB; iz++) {
+          const pz = oZ+(iz+0.5)*voxSz - az;
+          // Barycentric coords of voxel centre in triangle plane
+          const d20=px*ex+py*ey+pz*ez, d21=px*fx+py*fy+pz*fz;
+          let v, w;
+          if (Math.abs(den)>1e-12) { v=(d11*d20-d01*d21)/den; w=(d00*d21-d01*d20)/den; }
+          else                     { v=w=1/3; }
+          const u=1-v-w;
+          // Nearest point on triangle via clamped bary
+          const uc=Math.max(0,u), vc=Math.max(0,v), wc=Math.max(0,w);
+          const s=uc+vc+wc;
+          const nX=(vc*ex+wc*fx)/s, nY=(vc*ey+wc*fy)/s, nZ=(vc*ez+wc*fz)/s;
+          const dX=px-nX, dY=py-nY, dZ=pz-nZ;
+          if (dX*dX+dY*dY+dZ*dZ <= hd2) state[ix+iy*gx+iz*gx*gy] = SURF;
+        }
+      }
+    }
+  }
+
+  // ── Step 2: BFS flood fill from all 6 boundary faces ──────────────────────
+  const queue = new Int32Array(total);
+  let head = 0, tail = 0;
+  const seed = (i) => { if (!state[i]) { state[i]=OUT; queue[tail++]=i; } };
+
+  for (let ix=0;ix<gx;ix++) for (let iy=0;iy<gy;iy++) {
+    seed(ix+iy*gx); seed(ix+iy*gx+(gz-1)*gx*gy);
+  }
+  for (let ix=0;ix<gx;ix++) for (let iz=0;iz<gz;iz++) {
+    seed(ix+iz*gx*gy); seed(ix+(gy-1)*gx+iz*gx*gy);
+  }
+  for (let iy=0;iy<gy;iy++) for (let iz=0;iz<gz;iz++) {
+    seed(iy*gx+iz*gx*gy); seed((gx-1)+iy*gx+iz*gx*gy);
+  }
+
+  while (head < tail) {
+    const i = queue[head++];
+    const iz=(i/(gx*gy))|0, rem=i-iz*gx*gy, iy=(rem/gx)|0, ix=rem-iy*gx;
+    let n;
+    if (ix>0)    { n=i-1;      if(!state[n]){state[n]=OUT;queue[tail++]=n;} }
+    if (ix<gx-1) { n=i+1;      if(!state[n]){state[n]=OUT;queue[tail++]=n;} }
+    if (iy>0)    { n=i-gx;     if(!state[n]){state[n]=OUT;queue[tail++]=n;} }
+    if (iy<gy-1) { n=i+gx;     if(!state[n]){state[n]=OUT;queue[tail++]=n;} }
+    if (iz>0)    { n=i-gx*gy;  if(!state[n]){state[n]=OUT;queue[tail++]=n;} }
+    if (iz<gz-1) { n=i+gx*gy;  if(!state[n]){state[n]=OUT;queue[tail++]=n;} }
+  }
+
+  // ── Step 3: return state as-is (0=inside, 1=surface, 2=outside) ──────────
+  // Callers decide what to do with each category:
+  //  • visualisation → draw state===1 (surface shell, always correct)
+  //  • hollow test   → state===0 means "thick interior" → can hollow
+  return state;
+}
+
+/* ===== Hollow shell ===== */
+function performHollow(thickness) {
+  if (!mesh) return;
+
+  if (!occlusalNormal) {
+    const result = runOcclusalDetection();
+    occlusalNormal = result.normal;
+    occlusalCenter = result.center.clone();
+  }
+
+  pushUndo();
+
+  const N = occlusalNormal.clone().normalize();
+  const posArr = mesh.geometry.attributes.position.array;
+  const nTri = Math.floor(posArr.length / 9);
+
+  // Quantize helper
+  const bx = mesh.geometry.boundingBox || new THREE.Box3().setFromBufferAttribute(mesh.geometry.attributes.position);
+  const sz = new THREE.Vector3(); bx.getSize(sz);
+  const tol = Math.max(sz.x, sz.y, sz.z) * 1e-4 || 1e-6;
+  const qv = (i3) => `${Math.round(posArr[i3]/tol)},${Math.round(posArr[i3+1]/tol)},${Math.round(posArr[i3+2]/tol)}`;
+
+  // ── 1. Projection range along N ────────────────────────────────────────────
+  let minP = Infinity, maxP = -Infinity;
+  for (let i = 0; i < posArr.length; i += 3) {
+    const p = N.x*posArr[i] + N.y*posArr[i+1] + N.z*posArr[i+2];
+    if (p < minP) minP = p;
+    if (p > maxP) maxP = p;
+  }
+
+  // ── 2. Detect flat base cap faces ──────────────────────────────────────────
+  const EPS = Math.max(sz.x, sz.y, sz.z) * 0.01;
+  const baseTri = new Uint8Array(nTri);
+  for (let t = 0; t < nTri; t++) {
+    const b = t * 9;
+    const ax = posArr[b+3]-posArr[b],   ay = posArr[b+4]-posArr[b+1], az = posArr[b+5]-posArr[b+2];
+    const cx = posArr[b+6]-posArr[b],   cy = posArr[b+7]-posArr[b+1], cz = posArr[b+8]-posArr[b+2];
+    const fnx = ay*cz-az*cy, fny = az*cx-ax*cz, fnz = ax*cy-ay*cx;
+    const flen = Math.sqrt(fnx*fnx + fny*fny + fnz*fnz);
+    if (flen < 1e-12) continue;
+    if (Math.abs((fnx*N.x + fny*N.y + fnz*N.z) / flen) < 0.9) continue;
+    const p0 = N.x*posArr[b]   + N.y*posArr[b+1] + N.z*posArr[b+2];
+    const p1 = N.x*posArr[b+3] + N.y*posArr[b+4] + N.z*posArr[b+5];
+    const p2 = N.x*posArr[b+6] + N.y*posArr[b+7] + N.z*posArr[b+8];
+    if ((Math.abs(p0-minP)<EPS && Math.abs(p1-minP)<EPS && Math.abs(p2-minP)<EPS) ||
+        (Math.abs(p0-maxP)<EPS && Math.abs(p1-maxP)<EPS && Math.abs(p2-maxP)<EPS))
+      baseTri[t] = 1;
+  }
+
+  // ── 3. Angle-weighted vertex normals + position map ─────────────────────────
+  // Also store the actual vertex position per key so we can do spatial lookup.
+  const vnMap  = new Map(); // key → {nx,ny,nz, px,py,pz}
+
+  for (let t = 0; t < nTri; t++) {
+    if (baseTri[t]) continue;
+    const b = t * 9;
+    const pts = [
+      [posArr[b],   posArr[b+1], posArr[b+2]],
+      [posArr[b+3], posArr[b+4], posArr[b+5]],
+      [posArr[b+6], posArr[b+7], posArr[b+8]],
+    ];
+    const ks = [qv(b), qv(b+3), qv(b+6)];
+
+    const ax = pts[1][0]-pts[0][0], ay = pts[1][1]-pts[0][1], az = pts[1][2]-pts[0][2];
+    const cx = pts[2][0]-pts[0][0], cy = pts[2][1]-pts[0][1], cz = pts[2][2]-pts[0][2];
+    const fnx = ay*cz-az*cy, fny = az*cx-ax*cz, fnz = ax*cy-ay*cx;
+
+    for (let v = 0; v < 3; v++) {
+      const v1 = (v+1)%3, v2 = (v+2)%3;
+      const e1x = pts[v1][0]-pts[v][0], e1y = pts[v1][1]-pts[v][1], e1z = pts[v1][2]-pts[v][2];
+      const e2x = pts[v2][0]-pts[v][0], e2y = pts[v2][1]-pts[v][1], e2z = pts[v2][2]-pts[v][2];
+      const l1 = Math.sqrt(e1x*e1x + e1y*e1y + e1z*e1z);
+      const l2 = Math.sqrt(e2x*e2x + e2y*e2y + e2z*e2z);
+      const angle = (l1 > 1e-10 && l2 > 1e-10)
+        ? Math.acos(Math.max(-1, Math.min(1, (e1x*e2x + e1y*e2y + e1z*e2z) / (l1*l2))))
+        : 0;
+      const key = ks[v];
+      let e = vnMap.get(key);
+      if (!e) { e = {nx:0,ny:0,nz:0, px:pts[v][0],py:pts[v][1],pz:pts[v][2]}; vnMap.set(key, e); }
+      e.nx += fnx * angle; e.ny += fny * angle; e.nz += fnz * angle;
+    }
+  }
+  vnMap.forEach(e => {
+    const len = Math.sqrt(e.nx*e.nx + e.ny*e.ny + e.nz*e.nz);
+    if (len > 0) { e.nx /= len; e.ny /= len; e.nz /= len; }
+  });
+
+  // ── 3b. Voxelised inside/outside — thin-zone detection ──────────────────────
+  // Build a 3D occupancy grid using 3-axis majority vote (X, Y, Z column ray
+  // casting). Each axis independently fills a grid; a voxel is "inside" if at
+  // least 2 of 3 axes agree. This eliminates false results from degenerate
+  // triangles that are nearly parallel to any single projection axis.
+  const voxSz = 0.5; // mm — fine enough to detect sub-1 mm cusp thickness
+  const pad   = voxSz * 2;
+  const oX = bx.min.x - pad, oY = bx.min.y - pad, oZ = bx.min.z - pad;
+  const gx = Math.ceil((bx.max.x - bx.min.x + 2*pad) / voxSz) + 1;
+  const gy = Math.ceil((bx.max.y - bx.min.y + 2*pad) / voxSz) + 1;
+  const gz = Math.ceil((bx.max.z - bx.min.z + 2*pad) / voxSz) + 1;
+
+  // state: 0=inside solid, 1=surface shell, 2=outside
+  const state = buildOccupancy(posArr, nTri, voxSz, oX, oY, oZ, gx, gy, gz);
+
+  // Per-vertex: is the inward-offset point in solid interior (state===0)?
+  // state===0 means there's enough solid material → can hollow.
+  // state===1 (surface) or ===2 (outside) → thin zone → stay solid.
+  const safeOff = new Map();
+  vnMap.forEach((e, key) => {
+    const px = e.px - thickness*e.nx;
+    const py = e.py - thickness*e.ny;
+    const pz = e.pz - thickness*e.nz;
+    const ix = Math.floor((px-oX)/voxSz);
+    const iy = Math.floor((py-oY)/voxSz);
+    const iz = Math.floor((pz-oZ)/voxSz);
+    const inside = ix>=0 && ix<gx && iy>=0 && iy<gy && iz>=0 && iz<gz
+                   && state[ix + iy*gx + iz*gx*gy] === 0;
+    safeOff.set(key, inside ? thickness : 0);
+  });
+
+  // ── 4. Build outer + inner tris, track boundary edges ─────────────────────
+  // Vertices where safeOff < thickness are "thin" (teeth) → stay solid (no inner tri)
+  const SOLID_THRESH = thickness * 0.999;
+  const solidKeys = new Set();
+  safeOff.forEach((d, key) => { if (d < SOLID_THRESH) solidKeys.add(key); });
+
+  const verts = [];
+  const outerEdgeMap = new Map(); // all non-base tri edges
+  const innerEdgeMap = new Map(); // hollow (non-solid) tri edges only
+
+  for (let t = 0; t < nTri; t++) {
+    if (baseTri[t]) continue;
+    const b = t * 9;
+    const ks = [qv(b), qv(b+3), qv(b+6)];
+    const outerP = [[posArr[b],posArr[b+1],posArr[b+2]],
+                    [posArr[b+3],posArr[b+4],posArr[b+5]],
+                    [posArr[b+6],posArr[b+7],posArr[b+8]]];
+
+    // Outer tri always
+    verts.push(posArr[b],   posArr[b+1], posArr[b+2],
+               posArr[b+3], posArr[b+4], posArr[b+5],
+               posArr[b+6], posArr[b+7], posArr[b+8]);
+    for (let e = 0; e < 3; e++) {
+      const vA = e, vB = (e+1)%3;
+      const ek = ks[vA] < ks[vB] ? `${ks[vA]}||${ks[vB]}` : `${ks[vB]}||${ks[vA]}`;
+      if (!outerEdgeMap.has(ek)) outerEdgeMap.set(ek, { oA: outerP[vA], oB: outerP[vB], kA: ks[vA], kB: ks[vB], count: 0 });
+      outerEdgeMap.get(ek).count++;
+    }
+
+    // Inner tri only if all 3 vertices are in the hollow zone
+    const isHollow = !ks.some(k => solidKeys.has(k));
+    if (!isHollow) continue;
+
+    const ip = ks.map((k, vi) => {
+      const e  = vnMap.get(k) || {nx:0,ny:0,nz:0};
+      const d  = safeOff.get(k) ?? thickness;
+      const i3 = b + vi*3;
+      return [posArr[i3] - d*e.nx, posArr[i3+1] - d*e.ny, posArr[i3+2] - d*e.nz];
+    });
+    verts.push(...ip[0], ...ip[2], ...ip[1]);
+
+    for (let e = 0; e < 3; e++) {
+      const vA = e, vB = (e+1)%3;
+      const ek = ks[vA] < ks[vB] ? `${ks[vA]}||${ks[vB]}` : `${ks[vB]}||${ks[vA]}`;
+      if (!innerEdgeMap.has(ek)) innerEdgeMap.set(ek, { oA: outerP[vA], oB: outerP[vB], kA: ks[vA], kB: ks[vB], count: 0 });
+      innerEdgeMap.get(ek).count++;
+    }
+  }
+
+  // ── 5. Wall tris ───────────────────────────────────────────────────────────
+  // (a) Outer boundary edges (open bottom rim) — only where both verts are hollow
+  outerEdgeMap.forEach(({ oA, oB, kA, kB, count }) => {
+    if (count !== 1) return;
+    if (solidKeys.has(kA) || solidKeys.has(kB)) return;
+    const eA = vnMap.get(kA) || {nx:0,ny:0,nz:0};
+    const eB = vnMap.get(kB) || {nx:0,ny:0,nz:0};
+    const dA = safeOff.get(kA) ?? thickness;
+    const dB = safeOff.get(kB) ?? thickness;
+    const iA = [oA[0]-dA*eA.nx, oA[1]-dA*eA.ny, oA[2]-dA*eA.nz];
+    const iB = [oB[0]-dB*eB.nx, oB[1]-dB*eB.ny, oB[2]-dB*eB.nz];
+    verts.push(...oA, ...oB, ...iB);
+    verts.push(...oA, ...iB, ...iA);
+  });
+
+  // (b) Hollow↔solid sealing walls: inner boundary edges → back to outer surface
+  innerEdgeMap.forEach(({ oA, oB, kA, kB, count }) => {
+    if (count !== 1) return;
+    const eA = vnMap.get(kA) || {nx:0,ny:0,nz:0};
+    const eB = vnMap.get(kB) || {nx:0,ny:0,nz:0};
+    const dA = safeOff.get(kA) ?? thickness;
+    const dB = safeOff.get(kB) ?? thickness;
+    const iA = [oA[0]-dA*eA.nx, oA[1]-dA*eA.ny, oA[2]-dA*eA.nz];
+    const iB = [oB[0]-dB*eB.nx, oB[1]-dB*eB.ny, oB[2]-dB*eB.nz];
+    verts.push(...iA, ...iB, ...oB);
+    verts.push(...iA, ...oB, ...oA);
+  });
+
+  // ── 6. Build geometry ──────────────────────────────────────────────────────
+  const newPosArr = new Float32Array(verts);
+  const nVerts = newPosArr.length / 3;
+  const newColArr = new Float32Array(nVerts * 3);
+  for (let i = 0; i < nVerts; i++) {
+    newColArr[i*3]   = BASE_COLOR.r;
+    newColArr[i*3+1] = BASE_COLOR.g;
+    newColArr[i*3+2] = BASE_COLOR.b;
+  }
+
+  const newGeom = new THREE.BufferGeometry();
+  newGeom.setAttribute('position', new THREE.BufferAttribute(newPosArr, 3));
+  newGeom.setAttribute('color',    new THREE.BufferAttribute(newColArr, 3));
+  newGeom.computeVertexNormals();
+  newGeom.computeBoundingBox();
+  newGeom.computeBoundingSphere();
+
+  mesh.geometry.dispose();
+  mesh.geometry = newGeom;
+  innerMesh.geometry = newGeom;
+  bbox = newGeom.boundingBox.clone();
+  clearBoundaryLines();
+  updateExtrudePosDefault();
+  const baseFaceCount = Array.from(baseTri).filter(Boolean).length;
+  infoEl.textContent = `Hollow: ${thickness} mm wall · ${Math.floor(nVerts/3).toLocaleString()} triangles (removed ${baseFaceCount} base face${baseFaceCount!==1?'s':''})`;
+  updateInfo();
+}
+
+/* ===== Button: Make hollow ===== */
+btnHollow.addEventListener("click", () => {
+  if (!mesh) return;
+  withSpinner(() => {
+    const thickness = Math.max(0.1, parseFloat(hollowThicknessInput.value) || 2);
+    performHollow(thickness);
+  });
+});
+
+/* ===== Test: Voxelization visualization ===== */
+let voxelDebugMesh = null;
+
+function clearVoxelDebug() {
+  if (voxelDebugMesh) {
+    scene.remove(voxelDebugMesh);
+    voxelDebugMesh.geometry.dispose();
+    voxelDebugMesh.material.dispose();
+    voxelDebugMesh = null;
+  }
+}
+
+function testVoxelize() {
+  if (!mesh) return;
+
+  const voxSz     = Math.max(0.1, parseFloat(voxelSizeInput.value) || 0.5);
+  const thickness = Math.max(0.1, parseFloat(voxelThicknessInput.value) || 2);
+
+  const posArr = mesh.geometry.attributes.position.array;
+  const nTri   = Math.floor(posArr.length / 9);
+
+  // Bounding box
+  const bbx = mesh.geometry.boundingBox || new THREE.Box3().setFromBufferAttribute(mesh.geometry.attributes.position);
+  const pad  = voxSz * 2;
+  const oX = bbx.min.x - pad, oY = bbx.min.y - pad, oZ = bbx.min.z - pad;
+  const gx = Math.ceil((bbx.max.x - bbx.min.x + 2*pad) / voxSz) + 1;
+  const gy = Math.ceil((bbx.max.y - bbx.min.y + 2*pad) / voxSz) + 1;
+  const gz = Math.ceil((bbx.max.z - bbx.min.z + 2*pad) / voxSz) + 1;
+
+  // Build occupancy grid — surface rasterisation + flood fill
+  // state: 0=inside solid, 1=surface shell, 2=outside
+  const state = buildOccupancy(posArr, nTri, voxSz, oX, oY, oZ, gx, gy, gz);
+
+  showVoxelWireframe(state, gx, gy, gz, voxSz, oX, oY, oZ, 1, 0x44aaff);
+
+  lastVoxelState = state;
+  lastVoxelGrid  = { gx, gy, gz, voxSz, oX, oY, oZ };
+  lastVoxelSolid = solidifyVoxels(state, gx, gy, gz);
+  btnDownloadVoxel.disabled = false;
+  btnErodeVoxel.disabled    = false;
+}
+
+// Draw wireframe edges for voxels matching targetState.
+// targetState=1 → surface shell; targetState=0 → eroded interior.
+function showVoxelWireframe(state, gx, gy, gz, voxSz, oX, oY, oZ, targetState, color) {
+  clearVoxelDebug();
+  const linePos = [];
+  for (let iz = 0; iz < gz; iz++) {
+    for (let iy = 0; iy < gy; iy++) {
+      for (let ix = 0; ix < gx; ix++) {
+        if (state[ix + iy*gx + iz*gx*gy] !== targetState) continue;
+        const x0=oX+ix*voxSz, x1=x0+voxSz;
+        const y0=oY+iy*voxSz, y1=y0+voxSz;
+        const z0=oZ+iz*voxSz, z1=z0+voxSz;
+        linePos.push(x0,y0,z0, x1,y0,z0,  x0,y1,z0, x1,y1,z0,
+                     x0,y0,z1, x1,y0,z1,  x0,y1,z1, x1,y1,z1,
+                     x0,y0,z0, x0,y1,z0,  x1,y0,z0, x1,y1,z0,
+                     x0,y0,z1, x0,y1,z1,  x1,y0,z1, x1,y1,z1,
+                     x0,y0,z0, x0,y0,z1,  x1,y0,z0, x1,y0,z1,
+                     x0,y1,z0, x0,y1,z1,  x1,y1,z0, x1,y1,z1);
+      }
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(linePos), 3));
+  const mat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.6 });
+  voxelDebugMesh = new THREE.LineSegments(geo, mat);
+  scene.add(voxelDebugMesh);
+}
+
+btnTestVoxel.addEventListener("click", () => {
+  if (!mesh) return;
+  withSpinner(() => testVoxelize());
+});
+
+btnClearVoxel.addEventListener("click", () => clearVoxelDebug());
+
+btnToggleMesh.addEventListener("click", () => {
+  if (!mesh) return;
+  const hide = mesh.visible;
+  mesh.visible      = !hide;
+  innerMesh.visible = !hide;
+  const icon = btnToggleMesh.querySelector("i");
+  icon.setAttribute("data-lucide", hide ? "eye" : "eye-off");
+  btnToggleMesh.childNodes[btnToggleMesh.childNodes.length - 1].textContent = hide ? " Show model" : " Hide model";
+  lucide.createIcons();
+});
+
+btnDownloadVoxel.addEventListener("click", () => {
+  if (!lastVoxelSolid || !lastVoxelGrid) return;
+  const { gx, gy, gz, voxSz, oX, oY, oZ } = lastVoxelGrid;
+  const buf  = voxelsToSTLBuffer(lastVoxelSolid, gx, gy, gz, voxSz, oX, oY, oZ);
+  const blob = new Blob([buf], { type: "application/octet-stream" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = `${loadedFilename || "model"}_voxel.stl`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+});
+
+// Solidify: fill the interior of the surface shell using 3-axis scanline fill
+// (scan each axis, fill between first and last surface voxel in each line).
+// A voxel is solid if at least 2 of 3 axes include it — robust for open meshes.
+function solidifyVoxels(state, gx, gy, gz) {
+  const total = gx * gy * gz;
+  const slab = gx * gy;
+  // votes[i] counts how many axes include voxel i
+  const votes = new Uint8Array(total);
+
+  // Z-axis: for each (ix,iy) column, fill between min/max iz with state===1
+  for (let ix = 0; ix < gx; ix++) {
+    for (let iy = 0; iy < gy; iy++) {
+      let lo = -1, hi = -1;
+      for (let iz = 0; iz < gz; iz++) {
+        if (state[ix + iy*gx + iz*slab] === 1) { if (lo < 0) lo = iz; hi = iz; }
+      }
+      for (let iz = lo; iz <= hi; iz++) votes[ix + iy*gx + iz*slab]++;
+    }
+  }
+  // X-axis: for each (iy,iz) column
+  for (let iy = 0; iy < gy; iy++) {
+    for (let iz = 0; iz < gz; iz++) {
+      let lo = -1, hi = -1;
+      for (let ix = 0; ix < gx; ix++) {
+        if (state[ix + iy*gx + iz*slab] === 1) { if (lo < 0) lo = ix; hi = ix; }
+      }
+      for (let ix = lo; ix <= hi; ix++) votes[ix + iy*gx + iz*slab]++;
+    }
+  }
+  // Y-axis: for each (ix,iz) column
+  for (let ix = 0; ix < gx; ix++) {
+    for (let iz = 0; iz < gz; iz++) {
+      let lo = -1, hi = -1;
+      for (let iy = 0; iy < gy; iy++) {
+        if (state[ix + iy*gx + iz*slab] === 1) { if (lo < 0) lo = iy; hi = iy; }
+      }
+      for (let iy = lo; iy <= hi; iy++) votes[ix + iy*gx + iz*slab]++;
+    }
+  }
+
+  // Solid if at least 2 of 3 axes include the voxel
+  const solid = new Uint8Array(total).fill(2);
+  for (let i = 0; i < total; i++) if (votes[i] >= 2) solid[i] = 1;
+  return solid;
+}
+
+// Single-pass morphological erosion.
+// A voxel is kept only if all 5 non-bottom face-neighbours are occupied.
+// The -Z direction is intentionally ignored: voxels whose only empty neighbour
+// is below them (the base opening) are never eroded, so the hollow result
+// stays open at the bottom after subtraction (original − eroded).
+function erodeOccupancy(state, gx, gy, gz) {
+  const result = new Uint8Array(state.length).fill(2);
+  const stride = gx, slab = gx * gy;
+  for (let iz = 0; iz < gz; iz++) {
+    for (let iy = 0; iy < gy; iy++) {
+      for (let ix = 0; ix < gx; ix++) {
+        const i = ix + iy*stride + iz*slab;
+        if (state[i] === 2) continue;
+        const keep =
+          ix > 0    && state[i - 1]     !== 2 &&
+          ix < gx-1 && state[i + 1]     !== 2 &&
+          iy > 0    && state[i - stride] !== 2 &&
+          iy < gy-1 && state[i + stride] !== 2 &&
+          iz < gz-1 && state[i + slab]   !== 2;
+          // -Z omitted: bottom face is never an erosion trigger
+        if (keep) result[i] = 1;
+      }
+    }
+  }
+  return result;
+}
+
+btnErodeVoxel.addEventListener("click", () => {
+  if (!lastVoxelSolid || !lastVoxelGrid) return;
+  const { gx, gy, gz, voxSz, oX, oY, oZ } = lastVoxelGrid;
+  const thickness = Math.max(0.1, parseFloat(hollowThicknessInput.value) || 2);
+  const N = Math.max(1, Math.round(thickness / voxSz));
+
+  let state = lastVoxelSolid;
+  for (let pass = 0; pass < N; pass++) state = erodeOccupancy(state, gx, gy, gz);
+
+  showVoxelWireframe(state, gx, gy, gz, voxSz, oX, oY, oZ, 1, 0xff8833);
+  btnDownloadEroded.disabled = false;
+  lastVoxelState = state;
+  lastVoxelGrid  = { gx, gy, gz, voxSz, oX, oY, oZ };
+});
+
+btnDownloadEroded.addEventListener("click", () => {
+  if (!lastVoxelState || !lastVoxelGrid) return;
+  const { gx, gy, gz, voxSz, oX, oY, oZ } = lastVoxelGrid;
+  // Use the already-eroded state (0=occupied, 2=empty)
+  const buf  = voxelsToSTLBuffer(lastVoxelState, gx, gy, gz, voxSz, oX, oY, oZ);
+  const blob = new Blob([buf], { type: "application/octet-stream" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = `${loadedFilename || "model"}_eroded.stl`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+});
 
 /* ===== Button: Auto base ===== */
 btnAutoBase.addEventListener("click", () => {
