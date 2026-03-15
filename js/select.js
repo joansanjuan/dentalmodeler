@@ -7,7 +7,7 @@ import { FontLoader } from "three/addons/loaders/FontLoader.js";
 import { TextGeometry } from "three/addons/geometries/TextGeometry.js";
 import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
-import { Brush, Evaluator, ADDITION } from "three-bvh-csg";
+import { Brush, Evaluator, ADDITION, SUBTRACTION } from "three-bvh-csg";
 
 /* ===== Spinner helpers ===== */
 const spinnerOverlay = document.getElementById("spinnerOverlay");
@@ -272,47 +272,43 @@ function updateExtrusionPlane() {
 }
 
 /* ===== Segmentation JSON ===== */
+function applySegJSON(text) {
+  let json;
+  try { json = JSON.parse(text); }
+  catch { segInfo.textContent = "Invalid JSON file."; return; }
+
+  const labels = json.labels;
+  if (!Array.isArray(labels)) { segInfo.textContent = "No 'labels' array found in JSON."; return; }
+
+  const col = mesh.geometry.attributes.color;
+  const n   = col.count;
+  const buf = new Float32Array(n * 3);
+  const uniqueTeeth = new Set();
+
+  for (let i = 0; i < n; i++) {
+    const origIdx = objOriginalIndices ? objOriginalIndices[i] : i;
+    const label   = (origIdx < labels.length) ? labels[origIdx] : 0;
+    if (label !== 0) uniqueTeeth.add(label);
+    const c = fdiToColor(label);
+    buf[i*3] = c.r; buf[i*3+1] = c.g; buf[i*3+2] = c.b;
+    col.setXYZ(i, c.r, c.g, c.b);
+  }
+  col.needsUpdate = true;
+  segmentationColors = buf;
+  selectedSet.clear();
+  updateInfo();
+
+  const jaw = json.jaw ? ` · ${json.jaw}` : "";
+  segInfo.textContent = `${uniqueTeeth.size} teeth detected${jaw}`;
+}
+
 btnLoadSeg.addEventListener("click", () => segInput.click());
 
 segInput.addEventListener("change", (e) => {
   const f = e.target.files?.[0];
   if (!f || !mesh) return;
   const reader = new FileReader();
-  reader.onload = (ev) => {
-    let json;
-    try { json = JSON.parse(ev.target.result); }
-    catch { segInfo.textContent = "Invalid JSON file."; return; }
-
-    const labels = json.labels;
-    if (!Array.isArray(labels)) { segInfo.textContent = "No 'labels' array found in JSON."; return; }
-
-    const col  = mesh.geometry.attributes.color;
-    const n    = col.count;
-    const buf  = new Float32Array(n * 3);
-
-    // Count unique teeth for info
-    const uniqueTeeth = new Set();
-
-    for (let i = 0; i < n; i++) {
-      // Map non-indexed vertex i → original vertex index
-      const origIdx = objOriginalIndices ? objOriginalIndices[i] : i;
-      const label   = (origIdx < labels.length) ? labels[origIdx] : 0;
-      if (label !== 0) uniqueTeeth.add(label);
-      const c = fdiToColor(label);
-      buf[i*3] = c.r; buf[i*3+1] = c.g; buf[i*3+2] = c.b;
-      col.setXYZ(i, c.r, c.g, c.b);
-    }
-    col.needsUpdate = true;
-    segmentationColors = buf;
-
-    // Clear any active selection so colors are visible
-    selectedSet.clear();
-    updateInfo();
-
-    const jaw = json.jaw ? ` · ${json.jaw}` : "";
-    segInfo.textContent = `${uniqueTeeth.size} teeth detected${jaw}`;
-    segInput.value = "";
-  };
+  reader.onload = (ev) => { applySegJSON(ev.target.result); segInput.value = ""; };
   reader.readAsText(f);
 });
 
@@ -1795,12 +1791,167 @@ function performHollow(thickness) {
   updateInfo();
 }
 
+/* ===== Voxel hollow helpers ===== */
+
+// Build a Three.js BufferGeometry from an occupancy grid (state!==2 = occupied).
+// Only exposes faces adjacent to empty voxels (marching-cubes-style cube faces).
+function voxelsToGeometry(state, gx, gy, gz, voxSz, oX, oY, oZ) {
+  const slab = gx * gy;
+  const isOcc = (ix, iy, iz) => {
+    if (ix<0||ix>=gx||iy<0||iy>=gy||iz<0||iz>=gz) return false;
+    return state[ix + iy*gx + iz*slab] !== 2;
+  };
+  const pos = [];
+  const quad = (ax,ay,az, bx,by,bz, cx,cy,cz, dx,dy,dz) => {
+    pos.push(ax,ay,az, bx,by,bz, cx,cy,cz,
+             ax,ay,az, cx,cy,cz, dx,dy,dz);
+  };
+  for (let iz=0; iz<gz; iz++) for (let iy=0; iy<gy; iy++) for (let ix=0; ix<gx; ix++) {
+    if (!isOcc(ix,iy,iz)) continue;
+    const x0=oX+ix*voxSz, x1=x0+voxSz;
+    const y0=oY+iy*voxSz, y1=y0+voxSz;
+    const z0=oZ+iz*voxSz, z1=z0+voxSz;
+    if (!isOcc(ix-1,iy,iz)) quad(x0,y0,z0, x0,y0,z1, x0,y1,z1, x0,y1,z0);
+    if (!isOcc(ix+1,iy,iz)) quad(x1,y0,z0, x1,y1,z0, x1,y1,z1, x1,y0,z1);
+    if (!isOcc(ix,iy-1,iz)) quad(x0,y0,z0, x1,y0,z0, x1,y0,z1, x0,y0,z1);
+    if (!isOcc(ix,iy+1,iz)) quad(x0,y1,z0, x0,y1,z1, x1,y1,z1, x1,y1,z0);
+    if (!isOcc(ix,iy,iz-1)) quad(x0,y0,z0, x0,y1,z0, x1,y1,z0, x1,y0,z0);
+    if (!isOcc(ix,iy,iz+1)) quad(x0,y0,z1, x1,y0,z1, x1,y1,z1, x0,y1,z1);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// Extend the eroded solid in the "down" direction (opposite to occlusal up) all
+// the way to the grid boundary.  When the solid is subsequently subtracted from
+// the original mesh, this punches an opening through the base plate.
+function extendSolidToBase(solid, gx, gy, gz, upNx, upNy, upNz) {
+  const slab = gx * gy;
+  const ax = Math.abs(upNx), ay = Math.abs(upNy), az = Math.abs(upNz);
+
+  if (ay >= ax && ay >= az) {
+    if (upNy > 0) { // down = -Y → fill toward iy=0
+      for (let iz=0; iz<gz; iz++) for (let ix=0; ix<gx; ix++) {
+        let first = -1;
+        for (let iy=0; iy<gy; iy++) if (solid[ix+iy*gx+iz*slab]!==2){first=iy;break;}
+        if (first<=0) continue;
+        for (let iy=0; iy<first; iy++) solid[ix+iy*gx+iz*slab]=1;
+      }
+    } else {         // down = +Y → fill toward iy=gy-1
+      for (let iz=0; iz<gz; iz++) for (let ix=0; ix<gx; ix++) {
+        let last = -1;
+        for (let iy=gy-1; iy>=0; iy--) if (solid[ix+iy*gx+iz*slab]!==2){last=iy;break;}
+        if (last<0||last>=gy-1) continue;
+        for (let iy=last+1; iy<gy; iy++) solid[ix+iy*gx+iz*slab]=1;
+      }
+    }
+  } else if (ax >= ay && ax >= az) {
+    if (upNx > 0) { // down = -X
+      for (let iz=0; iz<gz; iz++) for (let iy=0; iy<gy; iy++) {
+        let first = -1;
+        for (let ix=0; ix<gx; ix++) if (solid[ix+iy*gx+iz*slab]!==2){first=ix;break;}
+        if (first<=0) continue;
+        for (let ix=0; ix<first; ix++) solid[ix+iy*gx+iz*slab]=1;
+      }
+    } else {         // down = +X
+      for (let iz=0; iz<gz; iz++) for (let iy=0; iy<gy; iy++) {
+        let last = -1;
+        for (let ix=gx-1; ix>=0; ix--) if (solid[ix+iy*gx+iz*slab]!==2){last=ix;break;}
+        if (last<0||last>=gx-1) continue;
+        for (let ix=last+1; ix<gx; ix++) solid[ix+iy*gx+iz*slab]=1;
+      }
+    }
+  } else {
+    if (upNz > 0) { // down = -Z
+      for (let iy=0; iy<gy; iy++) for (let ix=0; ix<gx; ix++) {
+        let first = -1;
+        for (let iz=0; iz<gz; iz++) if (solid[ix+iy*gx+iz*slab]!==2){first=iz;break;}
+        if (first<=0) continue;
+        for (let iz=0; iz<first; iz++) solid[ix+iy*gx+iz*slab]=1;
+      }
+    } else {         // down = +Z
+      for (let iy=0; iy<gy; iy++) for (let ix=0; ix<gx; ix++) {
+        let last = -1;
+        for (let iz=gz-1; iz>=0; iz--) if (solid[ix+iy*gx+iz*slab]!==2){last=iz;break;}
+        if (last<0||last>=gz-1) continue;
+        for (let iz=last+1; iz<gz; iz++) solid[ix+iy*gx+iz*slab]=1;
+      }
+    }
+  }
+}
+
+function performHollowVoxel(thickness) {
+  if (!mesh) return;
+
+  if (!occlusalNormal) {
+    const result = runOcclusalDetection();
+    occlusalNormal = result.normal;
+    occlusalCenter = result.center.clone();
+  }
+
+  pushUndo();
+
+  const upN  = occlusalNormal.clone().normalize();
+  // Voxel size: ~4 voxels per wall thickness, clamped to [0.5, 1.0] mm.
+  const voxSz = Math.max(0.5, Math.min(1.0, thickness / 4));
+
+  const posArr = mesh.geometry.attributes.position.array;
+  const nTri   = Math.floor(posArr.length / 9);
+
+  mesh.geometry.computeBoundingBox();
+  const bbx = mesh.geometry.boundingBox;
+  const pad  = voxSz * 2;
+  const oX = bbx.min.x - pad, oY = bbx.min.y - pad, oZ = bbx.min.z - pad;
+  const gx = Math.ceil((bbx.max.x - bbx.min.x + 2*pad) / voxSz) + 1;
+  const gy = Math.ceil((bbx.max.y - bbx.min.y + 2*pad) / voxSz) + 1;
+  const gz = Math.ceil((bbx.max.z - bbx.min.z + 2*pad) / voxSz) + 1;
+
+  // Build strictly-interior solid (same pipeline as testVoxelize).
+  const state = buildOccupancy(posArr, nTri, voxSz, oX, oY, oZ, gx, gy, gz);
+  let solid = solidifyAlongNormal(state, gx, gy, gz, upN.x, upN.y, upN.z);
+  for (let i = 0; i < solid.length; i++) if (state[i] === 1) solid[i] = 2;
+
+  // Erode N layers inward → leaves wall of ≈ thickness mm.
+  const N = Math.max(1, Math.round(thickness / voxSz));
+  for (let p = 0; p < N; p++) solid = erodeOccupancy(solid, gx, gy, gz);
+
+  // Extend solid toward the base → opens the bottom after subtraction.
+  extendSolidToBase(solid, gx, gy, gz, upN.x, upN.y, upN.z);
+
+  // Convert eroded solid to a mesh and subtract from original.
+  const voxGeo  = voxelsToGeometry(solid, gx, gy, gz, voxSz, oX, oY, oZ);
+  const brushA  = new Brush(sanitizeGeometryForCSG(mesh.geometry));
+  const brushB  = new Brush(sanitizeGeometryForCSG(voxGeo));
+  const csgResult = evaluator.evaluate(brushA, brushB, SUBTRACTION);
+
+  let newGeom = csgResult.geometry.clone();
+  newGeom.computeVertexNormals();
+  newGeom.computeBoundingBox();
+  newGeom.computeBoundingSphere();
+  if (newGeom.index) newGeom = newGeom.toNonIndexed();
+  newGeom = removeDegenerateTris(newGeom);
+  initVertexColors(newGeom);
+
+  mesh.geometry.dispose();
+  mesh.geometry      = newGeom;
+  innerMesh.geometry = newGeom;
+  bbox = newGeom.boundingBox ? newGeom.boundingBox.clone() : new THREE.Box3().setFromBufferAttribute(newGeom.attributes.position);
+  clearBoundaryLines();
+  updateExtrudePosDefault();
+
+  const nTris = Math.floor(newGeom.attributes.position.count / 3);
+  infoEl.textContent = `Hollow: ${thickness} mm wall · ${nTris.toLocaleString()} triangles`;
+  updateInfo();
+}
+
 /* ===== Button: Make hollow ===== */
 btnHollow.addEventListener("click", () => {
   if (!mesh) return;
   withSpinner(() => {
     const thickness = Math.max(0.1, parseFloat(hollowThicknessInput.value) || 2);
-    performHollow(thickness);
+    performHollowVoxel(thickness);
   });
 });
 
@@ -1819,29 +1970,44 @@ function clearVoxelDebug() {
 function testVoxelize() {
   if (!mesh) return;
 
-  const voxSz     = Math.max(0.1, parseFloat(voxelSizeInput.value) || 0.5);
-  const thickness = Math.max(0.1, parseFloat(voxelThicknessInput.value) || 2);
+  const voxSz = Math.max(0.1, parseFloat(voxelSizeInput.value) || 0.5);
 
   const posArr = mesh.geometry.attributes.position.array;
   const nTri   = Math.floor(posArr.length / 9);
 
-  // Bounding box
-  const bbx = mesh.geometry.boundingBox || new THREE.Box3().setFromBufferAttribute(mesh.geometry.attributes.position);
+  mesh.geometry.computeBoundingBox();
+  const bbx = mesh.geometry.boundingBox;
   const pad  = voxSz * 2;
   const oX = bbx.min.x - pad, oY = bbx.min.y - pad, oZ = bbx.min.z - pad;
   const gx = Math.ceil((bbx.max.x - bbx.min.x + 2*pad) / voxSz) + 1;
   const gy = Math.ceil((bbx.max.y - bbx.min.y + 2*pad) / voxSz) + 1;
   const gz = Math.ceil((bbx.max.z - bbx.min.z + 2*pad) / voxSz) + 1;
 
-  // Build occupancy grid — surface rasterisation + flood fill
-  // state: 0=inside solid, 1=surface shell, 2=outside
+  if (!occlusalNormal) {
+    const result = runOcclusalDetection();
+    occlusalNormal = result.normal;
+    occlusalCenter = result.center.clone();
+  }
+  const upN = occlusalNormal.clone().normalize();
+
+  // Step 1: surface rasterisation — marks voxels that touch the mesh (state===1).
   const state = buildOccupancy(posArr, nTri, voxSz, oX, oY, oZ, gx, gy, gz);
 
-  showVoxelWireframe(state, gx, gy, gz, voxSz, oX, oY, oZ, 1, 0x44aaff);
+  // Step 2: fill interior using single-axis scanline along the occlusal up direction.
+  const solid = solidifyAlongNormal(state, gx, gy, gz, upN.x, upN.y, upN.z);
 
-  lastVoxelState = state;
+  // Step 3: remove every voxel that intersects the mesh surface (state===1).
+  // These straddle the surface and would protrude outward.
+  // What remains is strictly inside the model.
+  for (let i = 0; i < solid.length; i++) {
+    if (state[i] === 1) solid[i] = 2;
+  }
+
+  showVoxelWireframe(solid, gx, gy, gz, voxSz, oX, oY, oZ, 1, 0x44aaff);
+
+  lastVoxelState = solid;
   lastVoxelGrid  = { gx, gy, gz, voxSz, oX, oY, oZ };
-  lastVoxelSolid = solidifyVoxels(state, gx, gy, gz);
+  lastVoxelSolid = solid;
   btnDownloadVoxel.disabled = false;
   btnErodeVoxel.disabled    = false;
 }
@@ -1907,49 +2073,58 @@ btnDownloadVoxel.addEventListener("click", () => {
   URL.revokeObjectURL(url);
 });
 
-// Solidify: fill the interior of the surface shell using 3-axis scanline fill
-// (scan each axis, fill between first and last surface voxel in each line).
-// A voxel is solid if at least 2 of 3 axes include it — robust for open meshes.
-function solidifyVoxels(state, gx, gy, gz) {
+// Fill the interior of the surface shell using a single-axis scanline aligned
+// with the occlusal "up" direction.  For each column parallel to the dominant
+// axis, voxels between the first and last SURF voxel in that column are marked
+// occupied.  Unlike the 3-axis majority-vote approach, this does NOT fill
+// inter-dental gaps: a column passing through a gap sees no surface voxels on
+// both sides along the up axis, so it is left empty.
+function solidifyAlongNormal(state, gx, gy, gz, upNx, upNy, upNz) {
   const total = gx * gy * gz;
-  const slab = gx * gy;
-  // votes[i] counts how many axes include voxel i
-  const votes = new Uint8Array(total);
-
-  // Z-axis: for each (ix,iy) column, fill between min/max iz with state===1
-  for (let ix = 0; ix < gx; ix++) {
-    for (let iy = 0; iy < gy; iy++) {
-      let lo = -1, hi = -1;
-      for (let iz = 0; iz < gz; iz++) {
-        if (state[ix + iy*gx + iz*slab] === 1) { if (lo < 0) lo = iz; hi = iz; }
-      }
-      for (let iz = lo; iz <= hi; iz++) votes[ix + iy*gx + iz*slab]++;
-    }
-  }
-  // X-axis: for each (iy,iz) column
-  for (let iy = 0; iy < gy; iy++) {
-    for (let iz = 0; iz < gz; iz++) {
-      let lo = -1, hi = -1;
-      for (let ix = 0; ix < gx; ix++) {
-        if (state[ix + iy*gx + iz*slab] === 1) { if (lo < 0) lo = ix; hi = ix; }
-      }
-      for (let ix = lo; ix <= hi; ix++) votes[ix + iy*gx + iz*slab]++;
-    }
-  }
-  // Y-axis: for each (ix,iz) column
-  for (let ix = 0; ix < gx; ix++) {
-    for (let iz = 0; iz < gz; iz++) {
-      let lo = -1, hi = -1;
-      for (let iy = 0; iy < gy; iy++) {
-        if (state[ix + iy*gx + iz*slab] === 1) { if (lo < 0) lo = iy; hi = iy; }
-      }
-      for (let iy = lo; iy <= hi; iy++) votes[ix + iy*gx + iz*slab]++;
-    }
-  }
-
-  // Solid if at least 2 of 3 axes include the voxel
+  const slab  = gx * gy;
   const solid = new Uint8Array(total).fill(2);
-  for (let i = 0; i < total; i++) if (votes[i] >= 2) solid[i] = 1;
+
+  // Dominant axis most aligned with the up vector
+  const ax = Math.abs(upNx), ay = Math.abs(upNy), az = Math.abs(upNz);
+
+  if (ay >= ax && ay >= az) {
+    // Y dominant — scan each (ix, iz) column along Y
+    for (let iz = 0; iz < gz; iz++) {
+      for (let ix = 0; ix < gx; ix++) {
+        let lo = -1, hi = -1;
+        for (let iy = 0; iy < gy; iy++) {
+          if (state[ix + iy*gx + iz*slab] === 1) { if (lo < 0) lo = iy; hi = iy; }
+        }
+        if (lo < 0) continue;
+        for (let iy = lo; iy <= hi; iy++) solid[ix + iy*gx + iz*slab] = 1;
+      }
+    }
+  } else if (ax >= ay && ax >= az) {
+    // X dominant — scan each (iy, iz) column along X
+    for (let iz = 0; iz < gz; iz++) {
+      for (let iy = 0; iy < gy; iy++) {
+        let lo = -1, hi = -1;
+        for (let ix = 0; ix < gx; ix++) {
+          if (state[ix + iy*gx + iz*slab] === 1) { if (lo < 0) lo = ix; hi = ix; }
+        }
+        if (lo < 0) continue;
+        for (let ix = lo; ix <= hi; ix++) solid[ix + iy*gx + iz*slab] = 1;
+      }
+    }
+  } else {
+    // Z dominant — scan each (ix, iy) column along Z
+    for (let iy = 0; iy < gy; iy++) {
+      for (let ix = 0; ix < gx; ix++) {
+        let lo = -1, hi = -1;
+        for (let iz = 0; iz < gz; iz++) {
+          if (state[ix + iy*gx + iz*slab] === 1) { if (lo < 0) lo = iz; hi = iz; }
+        }
+        if (lo < 0) continue;
+        for (let iz = lo; iz <= hi; iz++) solid[ix + iy*gx + iz*slab] = 1;
+      }
+    }
+  }
+
   return solid;
 }
 
@@ -2629,6 +2804,39 @@ stlInput.addEventListener("change", (e) => {
 /* ===== Load file ===== */
 const objLoader = new OBJLoader();
 
+function loadOBJText(text, filename) {
+  // Parse face→vertex indices directly from OBJ text (0-based, triangulated).
+  const faceIndices = [];
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (!t.startsWith('f ')) continue;
+    const verts = t.split(/\s+/).slice(1).map(tok => parseInt(tok.split('/')[0]) - 1);
+    for (let i = 1; i < verts.length - 1; i++) {
+      faceIndices.push(verts[0], verts[i], verts[i + 1]);
+    }
+  }
+  objOriginalIndices = faceIndices.length ? new Int32Array(faceIndices) : null;
+
+  const group = objLoader.parse(text);
+  const geos = [];
+  group.traverse((child) => {
+    if (child.isMesh && child.geometry) {
+      let g = child.geometry.index ? child.geometry.toNonIndexed() : child.geometry.clone();
+      if (!g.attributes.normal) g.computeVertexNormals();
+      geos.push(g);
+    }
+  });
+  if (!geos.length) { infoEl.textContent = "No geometry found in OBJ file."; return; }
+  const merged = geos.length === 1 ? geos[0] : mergeGeometries(geos, false);
+  merged.computeVertexNormals();
+  merged.computeBoundingBox();
+  merged.computeBoundingSphere();
+  segmentationColors = null;
+  segSection.style.display = "";
+  segInfo.textContent = "No segmentation loaded";
+  loadGeometryFromParsed(merged, filename);
+}
+
 function loadFile(file) {
   const ext = file.name.split('.').pop().toLowerCase();
   const reader = new FileReader();
@@ -2636,38 +2844,7 @@ function loadFile(file) {
     reader.onload = (e) => {
       const text = e.target.result;
 
-      // Parse face→vertex indices directly from OBJ text (0-based, triangulated).
-      // This guarantees correspondence with the labels array regardless of how
-      // OBJLoader handles vertex deduplication or normal splitting.
-      const faceIndices = [];
-      for (const line of text.split('\n')) {
-        const t = line.trim();
-        if (!t.startsWith('f ')) continue;
-        const verts = t.split(/\s+/).slice(1).map(tok => parseInt(tok.split('/')[0]) - 1);
-        for (let i = 1; i < verts.length - 1; i++) {
-          faceIndices.push(verts[0], verts[i], verts[i + 1]);
-        }
-      }
-      objOriginalIndices = faceIndices.length ? new Int32Array(faceIndices) : null;
-
-      const group = objLoader.parse(text);
-      const geos = [];
-      group.traverse((child) => {
-        if (child.isMesh && child.geometry) {
-          let g = child.geometry.index ? child.geometry.toNonIndexed() : child.geometry.clone();
-          if (!g.attributes.normal) g.computeVertexNormals();
-          geos.push(g);
-        }
-      });
-      if (!geos.length) { infoEl.textContent = "No geometry found in OBJ file."; return; }
-      const merged = geos.length === 1 ? geos[0] : mergeGeometries(geos, false);
-      merged.computeVertexNormals();
-      merged.computeBoundingBox();
-      merged.computeBoundingSphere();
-      segmentationColors = null;
-      segSection.style.display = "";
-      segInfo.textContent = "No segmentation loaded";
-      loadGeometryFromParsed(merged, file.name);
+      loadOBJText(text, file.name);
     };
     reader.readAsText(file);
   } else {
@@ -2750,21 +2927,33 @@ function loadGeometryFromParsed(geometry, filename) {
   updateInfo();
 }
 
-/* ===== Auto-load sample (only on ?sample or #sample) ===== */
-const isSampleRoute = /[?&#]sample\b/.test(location.href);
-if (isSampleRoute) {
-  fetch("samples/sample_Lower_clean.stl")
-    .then((res) => {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return res.arrayBuffer();
+/* ===== Auto-load sample ===== */
+const _sampleParam = new URLSearchParams(location.search).get('sample');
+
+if (_sampleParam === '01533UH2_upper') {
+  const base = 'samples/01533UH2_upper/01533UH2_upper';
+  fetch(`${base}.obj`)
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.text(); })
+    .then(text => {
+      loadOBJText(text, '01533UH2_upper.obj');
+      return fetch(`${base}.json`);
     })
-    .then((buffer) => loadGeometryFromBuffer(buffer, "sample_Lower_clean.stl"))
-    .catch((err) => {
-      console.error("Sample load failed:", err);
-      infoEl.textContent = "Load an STL to get started.";
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.text(); })
+    .then(text => applySegJSON(text))
+    .catch(err => {
+      console.error('Sample load failed:', err);
+      infoEl.textContent = 'Load an STL to get started.';
+    });
+} else if (/[?&#]sample\b/.test(location.href)) {
+  fetch('samples/sample_Lower_clean.stl')
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); })
+    .then(buffer => loadGeometryFromBuffer(buffer, 'sample_Lower_clean.stl'))
+    .catch(err => {
+      console.error('Sample load failed:', err);
+      infoEl.textContent = 'Load an STL to get started.';
     });
 } else {
-  infoEl.textContent = "Load an STL to get started.";
+  infoEl.textContent = 'Load an STL to get started.';
 }
 
 /* ===== Init ===== */
